@@ -50,9 +50,8 @@ defmodule SymphonyElixir.Tracker do
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
-    tracker_settings = Config.settings!().tracker
+  @spec bind_agent_tools(map() | struct()) :: map()
+  def bind_agent_tools(tracker_settings \\ Config.settings!().tracker) do
     adapter = adapter_for_settings!(tracker_settings)
     tool_specs = configured_agent_tool_specs(adapter, tracker_settings)
 

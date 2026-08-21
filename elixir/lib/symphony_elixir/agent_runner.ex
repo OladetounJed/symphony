@@ -4,8 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AttemptFuse, Codex.AppServer, Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -38,18 +37,19 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with :ok <- validate_attempt_fuse(Keyword.get(opts, :attempt_fuse)),
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+             :ok <- validate_attempt_fuse(Keyword.get(opts, :attempt_fuse)) do
+          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
         end
-
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
+    else
       {:error, reason} ->
         {:error, reason}
     end
@@ -89,7 +89,12 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    session_options =
+      [worker_host: worker_host]
+      |> Keyword.put(:attempt_fuse, Keyword.get(opts, :attempt_fuse))
+      |> Keyword.put(:dynamic_tool_binding, Keyword.get(opts, :dynamic_tool_binding))
+
+    with {:ok, session} <- AppServer.start_session(workspace, session_options) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -97,6 +102,9 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp validate_attempt_fuse(nil), do: :ok
+  defp validate_attempt_fuse(attempt_fuse) when is_map(attempt_fuse), do: AttemptFuse.validate_current(attempt_fuse)
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)

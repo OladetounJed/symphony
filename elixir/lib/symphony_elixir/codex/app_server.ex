@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{AttemptFuse, Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -38,9 +38,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = DynamicTool.bind()
+    attempt_fuse = Keyword.get(opts, :attempt_fuse)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with :ok <- validate_attempt_fuse(attempt_fuse),
+         {:ok, dynamic_tool_binding} <- session_tool_binding(opts, attempt_fuse),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
@@ -66,6 +68,20 @@ defmodule SymphonyElixir.Codex.AppServer do
           {:error, reason}
       end
     end
+  end
+
+  defp validate_attempt_fuse(nil), do: :ok
+  defp validate_attempt_fuse(attempt_fuse) when is_map(attempt_fuse), do: AttemptFuse.validate_current(attempt_fuse)
+
+  defp session_tool_binding(opts, %{enabled: true}) do
+    case Keyword.get(opts, :dynamic_tool_binding) do
+      %{} = binding -> {:ok, binding}
+      _ -> {:error, :attempt_fuse_tool_binding_missing}
+    end
+  end
+
+  defp session_tool_binding(opts, _attempt_fuse) do
+    {:ok, Keyword.get(opts, :dynamic_tool_binding) || DynamicTool.bind()}
   end
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}

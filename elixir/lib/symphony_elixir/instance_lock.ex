@@ -40,6 +40,12 @@ defmodule SymphonyElixir.InstanceLock do
   @spec attempt_fuse(GenServer.server()) :: AttemptFuse.snapshot()
   def attempt_fuse(server \\ __MODULE__), do: GenServer.call(server, :attempt_fuse)
 
+  @spec operational?(GenServer.server()) :: boolean()
+  def operational?(server \\ __MODULE__), do: GenServer.call(server, :operational?)
+
+  @spec trip(GenServer.server(), term()) :: :ok
+  def trip(server \\ __MODULE__, reason), do: GenServer.call(server, {:trip, reason})
+
   @impl true
   def init({port, attempt_fuse}) do
     options = [
@@ -51,13 +57,22 @@ defmodule SymphonyElixir.InstanceLock do
     ]
 
     case :gen_tcp.listen(port, options) do
-      {:ok, socket} -> {:ok, %{port: port, socket: socket, attempt_fuse: attempt_fuse}}
-      {:error, reason} -> {:stop, {:instance_lock_unavailable, port, reason}}
+      {:ok, socket} ->
+        {:ok, %{port: port, socket: socket, attempt_fuse: attempt_fuse, trip_reason: nil}}
+
+      {:error, reason} ->
+        {:stop, {:instance_lock_unavailable, port, reason}}
     end
   end
 
   @impl true
   def handle_call(:attempt_fuse, _from, state), do: {:reply, state.attempt_fuse, state}
+
+  def handle_call(:operational?, _from, state), do: {:reply, is_nil(state.trip_reason), state}
+
+  def handle_call({:trip, reason}, _from, state) do
+    {:reply, :ok, %{state | trip_reason: state.trip_reason || reason}}
+  end
 
   @impl true
   def terminate(_reason, %{socket: socket}) do

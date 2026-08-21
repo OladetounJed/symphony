@@ -34,6 +34,26 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
           observed_at: String.t()
         }
 
+  defmodule DurableFileOps do
+    @moduledoc false
+
+    @spec sync(:file.io_device()) :: :ok | {:error, term()}
+    def sync(file), do: :file.sync(file)
+
+    @spec sync_directory(Path.t()) :: :ok | {:error, term()}
+    def sync_directory(path) do
+      case :file.open(String.to_charlist(path), [:read, :raw, :directory]) do
+        {:ok, directory} ->
+          result = :file.sync(directory)
+          close_result = :file.close(directory)
+          if result == :ok, do: close_result, else: result
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
   @spec validate_settings(map()) :: :ok | {:error, term()}
   def validate_settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
@@ -132,16 +152,17 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     with {:ok, max_attempts} <- evidence_max(evidence),
          {:ok, settings} <- runtime_settings(tracker_settings, Keyword.put(opts, :allow_disabled, true)),
          {:ok, context} <-
-           issue_context(issue, settings, max_attempts, tracker_settings),
-         :ok <- write_quarantine(context, evidence) do
+           issue_context(issue, settings, max_attempts, tracker_settings) do
+      quarantine_result = write_quarantine(context, evidence)
+
       exhaustion_result =
         ensure_exhaustion_evidence(context, evidence, tracker_settings, request_fun)
 
       delete_result = remove_activation_label(context, tracker_settings, request_fun)
       confirmation_result = confirm_activation_label_absent(context, tracker_settings, request_fun)
 
-      case {exhaustion_result, confirmation_result} do
-        {{:ok, exhaustion}, :ok} ->
+      case {quarantine_result, exhaustion_result, confirmation_result} do
+        {:ok, {:ok, exhaustion}, :ok} ->
           {:ok,
            %{
              activation_label: context.activation_label,
@@ -149,10 +170,22 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
              deactivated: true
            }}
 
-        {{:error, evidence_reason}, :ok} ->
+        {{:error, quarantine_reason}, {:ok, exhaustion}, :ok} ->
+          {:error, {:deactivated_without_quarantine, quarantine_reason, exhaustion[:evidence_url]}}
+
+        {:ok, {:error, evidence_reason}, :ok} ->
           {:error, {:deactivated_without_exhaustion_evidence, evidence_reason}}
 
-        {evidence_result, {:error, confirmation_reason}} ->
+        {{:error, quarantine_reason}, {:error, evidence_reason}, :ok} ->
+          {:error, {:deactivated_without_local_or_exhaustion_evidence, quarantine_reason, evidence_reason}}
+
+        {{:error, quarantine_reason}, evidence_result, {:error, confirmation_reason}} ->
+          unfenced =
+            {:attempt_deactivation_unfenced, quarantine_reason, delete_result, confirmation_reason, evidence_result}
+
+          {:error, unfenced}
+
+        {:ok, evidence_result, {:error, confirmation_reason}} ->
           {:error, {:attempt_deactivation_failed, delete_result, confirmation_reason, evidence_result}}
       end
     end
@@ -479,9 +512,9 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     encoded = Jason.encode!(state)
 
     with :ok <- validate_local_target(path, target_reason),
-         :ok <- File.write(temporary_path, encoded, [:exclusive]),
-         :ok <- File.chmod(temporary_path, 0o600),
+         :ok <- write_synced_temporary(temporary_path, encoded),
          :ok <- File.rename(temporary_path, path),
+         :ok <- sync_directory(Path.dirname(path)),
          :ok <- validate_local_target(path, target_reason) do
       :ok
     else
@@ -489,6 +522,31 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
         _ = File.rm(temporary_path)
         {:error, normalize_local_write_error(reason, write_reason)}
     end
+  end
+
+  defp write_synced_temporary(path, encoded) do
+    case :file.open(String.to_charlist(path), [:write, :exclusive, :binary, :raw]) do
+      {:ok, file} ->
+        result =
+          with :ok <- :file.write(file, encoded),
+               :ok <- File.chmod(path, 0o600) do
+            durable_file_ops().sync(file)
+          end
+
+        close_result = :file.close(file)
+        if result == :ok, do: close_result, else: result
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp sync_directory(path) do
+    durable_file_ops().sync_directory(path)
+  end
+
+  defp durable_file_ops do
+    Application.get_env(:symphony_elixir, :attempt_ledger_file_ops, DurableFileOps)
   end
 
   defp validate_local_target(path, reason) do
@@ -1238,12 +1296,15 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   defp resolve_high_water_root(_value, _opts), do: {:error, :github_attempt_high_water_root_missing}
 
   defp prepare_high_water_root(root, workspace_root) do
-    with {:ok, canonical_root} <- PathSafety.canonicalize(root),
+    with :ok <- reject_symlink_components(root),
+         {:ok, root_preexisted?} <- root_preexisting_directory?(root),
+         {:ok, canonical_root} <- PathSafety.canonicalize(root),
          {:ok, canonical_workspace} <- canonical_workspace(workspace_root),
          :ok <- validate_root_separation(canonical_root, canonical_workspace),
          :ok <- File.mkdir_p(canonical_root),
-         :ok <- reject_symlink_components(canonical_root),
-         :ok <- File.chmod(canonical_root, 0o700),
+         :ok <- reject_symlink_components(root),
+         :ok <- confirm_canonical_root(root, canonical_root),
+         :ok <- secure_root_permissions(canonical_root, root_preexisted?),
          :ok <- validate_secure_directory(canonical_root) do
       {:ok, canonical_root}
     else
@@ -1252,6 +1313,26 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp root_preexisting_directory?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} -> {:ok, true}
+      {:ok, _stat} -> {:error, :github_attempt_high_water_root_insecure}
+      {:error, :enoent} -> {:ok, false}
+      {:error, reason} -> {:error, {:github_attempt_high_water_root_lstat, reason}}
+    end
+  end
+
+  defp secure_root_permissions(path, true), do: validate_secure_directory(path)
+  defp secure_root_permissions(path, false), do: File.chmod(path, 0o700)
+
+  defp confirm_canonical_root(root, expected) do
+    case PathSafety.canonicalize(root) do
+      {:ok, ^expected} -> :ok
+      {:ok, _changed} -> {:error, :github_attempt_high_water_root_changed}
+      {:error, reason} -> {:error, reason}
     end
   end
 

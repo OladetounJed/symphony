@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.GitHub.AttemptLedger
+  alias SymphonyElixir.{GitHub.AttemptLedger, InstanceLock}
 
   @attempt_marker "<!-- iwe-symphony-attempt:v1 -->\n"
   @exhaustion_marker "<!-- iwe-symphony-exhaustion:v1 -->\n"
@@ -41,6 +41,30 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
       })
 
       {:ok, %{deactivated: true}}
+    end
+  end
+
+  defmodule UnfencedAttemptLedger do
+    def reserve(issue, max_attempts, _attempt_fuse) do
+      send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {
+        :attempt_reserve_called,
+        issue.id,
+        max_attempts
+      })
+
+      {:error, :reservation_confirmation_failed}
+    end
+
+    def deactivate(_issue, _evidence, _attempt_fuse) do
+      quarantine_reason = :local_quarantine_failed
+      delete_reason = :remote_delete_failed
+      confirmation_reason = :remote_confirmation_failed
+      evidence_reason = {:error, :remote_evidence_failed}
+
+      reason =
+        {:attempt_deactivation_unfenced, quarantine_reason, delete_reason, confirmation_reason, evidence_reason}
+
+      {:error, reason}
     end
   end
 
@@ -148,13 +172,65 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     end
   end
 
-  defmodule FailingTaskStarter do
-    def start_child(_supervisor, _fun), do: {:error, :scripted_spawn_failure}
+  defmodule FailOnceTaskStarter do
+    def start_child(supervisor, fun) do
+      state = Application.fetch_env!(:symphony_elixir, :attempt_fuse_task_starter_state)
+
+      fail? =
+        Agent.get_and_update(state, fn
+          :fail -> {true, :delegate}
+          :delegate -> {false, :delegate}
+        end)
+
+      if fail?, do: {:error, :scripted_spawn_failure}, else: Task.Supervisor.start_child(supervisor, fun)
+    end
+  end
+
+  defmodule StallingRunner do
+    def run(_issue, _recipient, opts) do
+      attempt = Keyword.fetch!(opts, :attempt)
+      send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {:worker_started, attempt})
+
+      if attempt == 1, do: Process.sleep(:infinity), else: :ok
+    end
+  end
+
+  defmodule FifthBoundaryRunner do
+    def run(issue, recipient, opts) do
+      attempt = Keyword.fetch!(opts, :attempt)
+      send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {:worker_started, attempt})
+
+      case {attempt, Application.fetch_env!(:symphony_elixir, :fifth_boundary_mode)} do
+        {5, :silent_stall} ->
+          Process.sleep(:infinity)
+
+        {5, :input_stall} ->
+          send(recipient, {
+            :codex_worker_update,
+            issue.id,
+            %{event: :turn_input_required, timestamp: DateTime.utc_now()}
+          })
+
+          Process.sleep(:infinity)
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defmodule FailOnFifthTaskStarter do
+    def start_child(supervisor, fun) do
+      state = Application.fetch_env!(:symphony_elixir, :attempt_fuse_task_starter_state)
+      count = Agent.get_and_update(state, fn count -> {count + 1, count + 1} end)
+
+      if count == 5, do: {:error, :fifth_spawn_failed}, else: Task.Supervisor.start_child(supervisor, fun)
+    end
   end
 
   test "reservation failure blocks and deactivates before any worker process starts" do
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-attempt-orchestrator-#{suffix}")
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-orchestrator-#{suffix}")
     lock_port = available_port()
     workflow_path = Workflow.workflow_file_path()
     runtime_name = Module.concat(__MODULE__, "Runtime#{suffix}")
@@ -207,9 +283,77 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     assert Supervisor.which_children(task_supervisor_name) == []
   end
 
+  test "an unfenced deactivation trips the outer lock and survives inner runtime restart" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-unfenced-#{suffix}")
+    lock_port = available_port()
+    workflow_path = Workflow.workflow_file_path()
+    runtime_name = Module.concat(__MODULE__, "UnfencedRuntime#{suffix}")
+    worker_runtime_name = Module.concat(__MODULE__, "UnfencedWorkers#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "UnfencedOrchestrator#{suffix}")
+    lock_name = Module.concat(__MODULE__, "UnfencedLock#{suffix}")
+    issue = issue(suffix)
+
+    stop_default_runtime!()
+    Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
+    Application.put_env(:symphony_elixir, :github_attempt_ledger_module, UnfencedAttemptLedger)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
+
+    on_exit(fn ->
+      if pid = Process.whereis(runtime_name), do: GenServer.stop(pid)
+
+      for key <- [
+            :github_client_module,
+            :github_attempt_ledger_module,
+            :attempt_fuse_test_issue,
+            :attempt_fuse_test_pid
+          ] do
+        Application.delete_env(:symphony_elixir, key)
+      end
+
+      write_workflow_file!(workflow_path, tracker_kind: "memory")
+      restart_default_runtime!()
+      File.rm_rf(root)
+    end)
+
+    write_github_attempt_workflow!(workflow_path, root, lock_port)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, runtime_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_name,
+               worker_runtime_name: worker_runtime_name,
+               orchestrator_name: orchestrator_name,
+               task_supervisor_name: Module.concat(__MODULE__, "UnfencedTasks#{suffix}"),
+               instance_lock_name: lock_name
+             )
+
+    Process.unlink(runtime_pid)
+    assert_receive {:attempt_reserve_called, issue_id, 5}, 3_000
+    assert issue_id == issue.id
+
+    assert eventually_value(fn ->
+             if InstanceLock.operational?(lock_name) == false, do: :tripped
+           end) == :tripped
+
+    first_orchestrator = Process.whereis(orchestrator_name)
+    GenServer.stop(first_orchestrator)
+
+    restarted_orchestrator =
+      eventually_value(fn ->
+        pid = Process.whereis(orchestrator_name)
+        if is_pid(pid) and pid != first_orchestrator, do: pid
+      end)
+
+    assert is_pid(restarted_orchestrator)
+    assert :sys.get_state(orchestrator_name).dispatch_suspended
+    refute_receive {:attempt_reserve_called, _, _}, 100
+  end
+
   test "real supervised runtime starts exactly five workers across restart and never reaches Codex" do
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-attempt-rehearsal-#{suffix}")
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-rehearsal-#{suffix}")
     lock_port = available_port()
     workflow_path = Workflow.workflow_file_path()
     runtime_name = Module.concat(__MODULE__, "RehearsalRuntime#{suffix}")
@@ -262,10 +406,14 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     assert {:ok, first_runtime} = SymphonyElixir.AgentRuntimeSupervisor.start_link(runtime_opts)
     Process.unlink(first_runtime)
 
-    for attempt <- 1..2 do
-      assert_receive {:attempt_reserved, ^attempt}, 3_000
-      assert_receive {:worker_started, ^attempt}, 3_000
-    end
+    assert_next_event({:attempt_reserved, 1})
+    assert_next_event({:worker_started, 1})
+    assert_next_event({:attempt_reserved, 2})
+    assert_next_event({:worker_started, 2})
+
+    force_retry(orchestrator_name, issue.id)
+    assert_next_event({:attempt_reserved, 3})
+    assert_next_event({:worker_started, 3})
 
     GenServer.stop(first_runtime)
     assert is_nil(Process.whereis(orchestrator_name))
@@ -273,9 +421,9 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     assert {:ok, second_runtime} = SymphonyElixir.AgentRuntimeSupervisor.start_link(runtime_opts)
     Process.unlink(second_runtime)
 
-    for attempt <- 3..5 do
-      assert_receive {:attempt_reserved, ^attempt}, 3_000
-      assert_receive {:worker_started, ^attempt}, 3_000
+    for attempt <- 4..5 do
+      assert_next_event({:attempt_reserved, attempt})
+      assert_next_event({:worker_started, attempt})
     end
 
     assert_receive {:attempt_deactivated, {:ok, %{deactivated: true}}}, 3_000
@@ -294,7 +442,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
 
   test "a consumed reservation remains visible when task spawning fails" do
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-attempt-spawn-failure-#{suffix}")
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-spawn-failure-#{suffix}")
     lock_port = available_port()
     workflow_path = Workflow.workflow_file_path()
     runtime_name = Module.concat(__MODULE__, "SpawnRuntime#{suffix}")
@@ -307,7 +455,10 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     stop_default_runtime!()
     Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
     Application.put_env(:symphony_elixir, :github_attempt_ledger_module, RecordingAttemptLedger)
-    Application.put_env(:symphony_elixir, :task_starter_module, FailingTaskStarter)
+    {:ok, task_starter_state} = Agent.start_link(fn -> :fail end)
+    Application.put_env(:symphony_elixir, :task_starter_module, FailOnceTaskStarter)
+    Application.put_env(:symphony_elixir, :agent_runner_module, ScriptedRunner)
+    Application.put_env(:symphony_elixir, :attempt_fuse_task_starter_state, task_starter_state)
     Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
     Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
     Application.put_env(:symphony_elixir, :attempt_fuse_remote, remote)
@@ -315,11 +466,14 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     on_exit(fn ->
       if pid = Process.whereis(runtime_name), do: GenServer.stop(pid)
       if Process.alive?(remote), do: Agent.stop(remote)
+      if Process.alive?(task_starter_state), do: Agent.stop(task_starter_state)
 
       for key <- [
             :github_client_module,
             :github_attempt_ledger_module,
             :task_starter_module,
+            :agent_runner_module,
+            :attempt_fuse_task_starter_state,
             :attempt_fuse_test_issue,
             :attempt_fuse_test_pid,
             :attempt_fuse_remote
@@ -355,11 +509,88 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
              end)
 
     assert error =~ "scripted_spawn_failure"
+
+    force_retry(orchestrator_name, issue.id)
+    assert_next_event({:attempt_reserved, 2})
+    assert_next_event({:worker_started, 2})
+  end
+
+  test "stall recovery consumes and confirms another durable reservation before restart" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-stall-#{suffix}")
+    lock_port = available_port()
+    workflow_path = Workflow.workflow_file_path()
+    runtime_name = Module.concat(__MODULE__, "StallRuntime#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "StallOrchestrator#{suffix}")
+
+    issue =
+      %{issue(suffix) | id: "42", identifier: "GH-42", native_ref: Map.merge(issue(suffix).native_ref, %{"number" => 42, "id" => 4_242, "node_id" => "I_42"})}
+
+    {:ok, remote} = Agent.start_link(fn -> remote_state() end)
+
+    stop_default_runtime!()
+    Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
+    Application.put_env(:symphony_elixir, :github_attempt_ledger_module, RecordingAttemptLedger)
+    Application.put_env(:symphony_elixir, :agent_runner_module, StallingRunner)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
+    Application.put_env(:symphony_elixir, :attempt_fuse_remote, remote)
+
+    on_exit(fn ->
+      if pid = Process.whereis(runtime_name), do: GenServer.stop(pid)
+      if Process.alive?(remote), do: Agent.stop(remote)
+
+      for key <- [
+            :github_client_module,
+            :github_attempt_ledger_module,
+            :agent_runner_module,
+            :attempt_fuse_test_issue,
+            :attempt_fuse_test_pid,
+            :attempt_fuse_remote
+          ] do
+        Application.delete_env(:symphony_elixir, key)
+      end
+
+      write_workflow_file!(workflow_path, tracker_kind: "memory")
+      restart_default_runtime!()
+      File.rm_rf(root)
+    end)
+
+    write_github_attempt_workflow!(workflow_path, root, lock_port, stall_timeout_ms: 1)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, runtime_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_name,
+               orchestrator_name: orchestrator_name,
+               task_supervisor_name: Module.concat(__MODULE__, "StallTasks#{suffix}"),
+               instance_lock_name: Module.concat(__MODULE__, "StallLock#{suffix}")
+             )
+
+    Process.unlink(runtime_pid)
+    assert_next_event({:attempt_reserved, 1})
+    assert_next_event({:worker_started, 1})
+
+    force_retry(orchestrator_name, issue.id)
+    assert_next_event({:attempt_reserved, 2})
+    assert_next_event({:worker_started, 2})
+  end
+
+  test "a silent fifth-worker stall deactivates without a sixth reservation" do
+    run_fifth_boundary_scenario(:silent_stall)
+  end
+
+  test "an input-required fifth-worker stall deactivates without an in-memory-only block" do
+    run_fifth_boundary_scenario(:input_stall)
+  end
+
+  test "a fifth task-spawn failure deactivates immediately without retrying" do
+    run_fifth_boundary_scenario(:spawn_failure)
   end
 
   test "a queued retry fails closed when any frozen fuse setting reloads" do
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-attempt-reload-#{suffix}")
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-reload-#{suffix}")
     lock_port = available_port()
     workflow_path = Workflow.workflow_file_path()
     runtime_name = Module.concat(__MODULE__, "ReloadRuntime#{suffix}")
@@ -444,6 +675,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
 
   defp write_github_attempt_workflow!(path, root, lock_port, opts \\ []) do
     source_revision = Keyword.get(opts, :source_revision, String.duplicate("a", 40))
+    stall_timeout_ms = Keyword.get(opts, :stall_timeout_ms, 300_000)
 
     File.write!(
       path,
@@ -478,6 +710,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
         instance_lock_port: #{lock_port}
       codex:
         command: "codex app-server"
+        stall_timeout_ms: #{stall_timeout_ms}
       ---
 
       Disposable attempt-fuse rehearsal.
@@ -529,6 +762,11 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     port
   end
 
+  defp canonical_tmp_dir do
+    {:ok, path} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    path
+  end
+
   defp eventually_value(fun, attempts \\ 50)
 
   defp eventually_value(fun, attempts) when attempts > 0 do
@@ -543,4 +781,112 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
   end
 
   defp eventually_value(_fun, 0), do: nil
+
+  defp assert_next_event(expected, timeout \\ 3_000) do
+    receive do
+      message -> assert message == expected
+    after
+      timeout -> flunk("timed out waiting for #{inspect(expected)}")
+    end
+  end
+
+  defp force_retry(orchestrator_name, issue_id) do
+    retry =
+      eventually_value(fn ->
+        state = :sys.get_state(orchestrator_name)
+        Map.get(state.retry_attempts, issue_id)
+      end)
+
+    assert is_map(retry)
+    send(orchestrator_name, {:retry_issue, issue_id, retry.retry_token})
+  end
+
+  defp run_fifth_boundary_scenario(mode) do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-fifth-boundary-#{mode}-#{suffix}")
+    workflow_path = Workflow.workflow_file_path()
+    runtime_name = Module.concat(__MODULE__, "FifthRuntime#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "FifthOrchestrator#{suffix}")
+
+    issue =
+      %{issue(suffix) | id: "42", identifier: "GH-42", native_ref: Map.merge(issue(suffix).native_ref, %{"number" => 42, "id" => 4_242, "node_id" => "I_42"})}
+
+    {:ok, remote} = Agent.start_link(fn -> remote_state() end)
+    {:ok, starter_state} = Agent.start_link(fn -> 0 end)
+
+    stop_default_runtime!()
+    Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
+    Application.put_env(:symphony_elixir, :github_attempt_ledger_module, RecordingAttemptLedger)
+    Application.put_env(:symphony_elixir, :agent_runner_module, FifthBoundaryRunner)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
+    Application.put_env(:symphony_elixir, :attempt_fuse_remote, remote)
+    Application.put_env(:symphony_elixir, :fifth_boundary_mode, mode)
+    Application.put_env(:symphony_elixir, :attempt_fuse_task_starter_state, starter_state)
+
+    if mode == :spawn_failure do
+      Application.put_env(:symphony_elixir, :task_starter_module, FailOnFifthTaskStarter)
+    end
+
+    on_exit(fn ->
+      if pid = Process.whereis(runtime_name), do: GenServer.stop(pid)
+      if Process.alive?(remote), do: Agent.stop(remote)
+      if Process.alive?(starter_state), do: Agent.stop(starter_state)
+
+      for key <- [
+            :github_client_module,
+            :github_attempt_ledger_module,
+            :agent_runner_module,
+            :attempt_fuse_test_issue,
+            :attempt_fuse_test_pid,
+            :attempt_fuse_remote,
+            :fifth_boundary_mode,
+            :attempt_fuse_task_starter_state,
+            :task_starter_module
+          ] do
+        Application.delete_env(:symphony_elixir, key)
+      end
+
+      write_workflow_file!(workflow_path, tracker_kind: "memory")
+      restart_default_runtime!()
+      File.rm_rf(root)
+    end)
+
+    write_github_attempt_workflow!(workflow_path, root, available_port(), stall_timeout_ms: 1)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, runtime_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_name,
+               orchestrator_name: orchestrator_name,
+               task_supervisor_name: Module.concat(__MODULE__, "FifthTasks#{suffix}"),
+               instance_lock_name: Module.concat(__MODULE__, "FifthLock#{suffix}")
+             )
+
+    Process.unlink(runtime_pid)
+
+    for attempt <- 1..4 do
+      assert_next_event({:attempt_reserved, attempt})
+      assert_next_event({:worker_started, attempt})
+      force_retry(orchestrator_name, issue.id)
+    end
+
+    assert_next_event({:attempt_reserved, 5})
+
+    if mode != :spawn_failure do
+      assert_next_event({:worker_started, 5})
+    end
+
+    assert_receive {:attempt_deactivated, {:ok, %{deactivated: true}}}, 3_000
+    refute_receive {:attempt_reserved, 6}, 100
+    refute_receive {:worker_started, 6}, 0
+
+    assert %{running: [], retrying: [], blocked: [%{attempt_usage: %{used: 5, exhausted: true}}]} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    snapshot = Agent.get(remote, & &1)
+    assert Enum.count(snapshot.comments, &String.starts_with?(&1["body"], @attempt_marker)) == 5
+    assert Enum.count(snapshot.comments, &String.starts_with?(&1["body"], @exhaustion_marker)) == 1
+    refute "pilot:symphony" in snapshot.labels
+  end
 end

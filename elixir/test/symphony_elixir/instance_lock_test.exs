@@ -4,7 +4,11 @@ defmodule SymphonyElixir.InstanceLockTest do
   alias SymphonyElixir.InstanceLock
 
   defmodule EmptyGitHubClient do
-    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issues_by_states(_states) do
+      Agent.update(Application.fetch_env!(:symphony_elixir, :instance_lock_call_counter), &(&1 + 1))
+      {:ok, []}
+    end
+
     def fetch_issues_by_ids(_ids), do: {:ok, []}
   end
 
@@ -35,7 +39,7 @@ defmodule SymphonyElixir.InstanceLockTest do
   test "a second full agent runtime cannot reach its poller while the singleton is held" do
     Process.flag(:trap_exit, true)
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-full-runtime-lock-#{suffix}")
+    root = Path.join(canonical_tmp_dir(), "symphony-full-runtime-lock-#{suffix}")
     port = available_port()
     workflow_path = Workflow.workflow_file_path()
     first_runtime = Module.concat(__MODULE__, "FirstRuntime#{suffix}")
@@ -45,8 +49,10 @@ defmodule SymphonyElixir.InstanceLockTest do
     second_runtime = Module.concat(__MODULE__, "SecondRuntime#{suffix}")
     second_lock = Module.concat(__MODULE__, "SecondLock#{suffix}")
     second_orchestrator = Module.concat(__MODULE__, "SecondOrchestrator#{suffix}")
+    {:ok, call_counter} = Agent.start_link(fn -> 0 end)
 
     Application.put_env(:symphony_elixir, :github_client_module, EmptyGitHubClient)
+    Application.put_env(:symphony_elixir, :instance_lock_call_counter, call_counter)
     write_attempt_workflow!(workflow_path, root, port)
     assert :ok = WorkflowStore.force_reload()
 
@@ -54,6 +60,8 @@ defmodule SymphonyElixir.InstanceLockTest do
       if pid = Process.whereis(first_runtime), do: GenServer.stop(pid)
       if pid = Process.whereis(second_runtime), do: GenServer.stop(pid)
       Application.delete_env(:symphony_elixir, :github_client_module)
+      Application.delete_env(:symphony_elixir, :instance_lock_call_counter)
+      if Process.alive?(call_counter), do: Agent.stop(call_counter)
       write_workflow_file!(workflow_path, tracker_kind: "memory")
       File.rm_rf(root)
     end)
@@ -68,6 +76,12 @@ defmodule SymphonyElixir.InstanceLockTest do
 
     Process.unlink(first_pid)
 
+    baseline_calls =
+      eventually_value(fn ->
+        count = Agent.get(call_counter, & &1)
+        if count >= 2, do: count
+      end)
+
     lock_error =
       {:shutdown, {:failed_to_start_child, second_lock, {:instance_lock_unavailable, port, :eaddrinuse}}}
 
@@ -81,6 +95,8 @@ defmodule SymphonyElixir.InstanceLockTest do
 
     assert is_nil(Process.whereis(second_orchestrator))
     assert is_pid(Process.whereis(first_orchestrator))
+    Process.sleep(50)
+    assert Agent.get(call_counter, & &1) == baseline_calls
   end
 
   defp available_port do
@@ -96,6 +112,26 @@ defmodule SymphonyElixir.InstanceLockTest do
     :ok = :gen_tcp.close(socket)
     port
   end
+
+  defp canonical_tmp_dir do
+    {:ok, path} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    path
+  end
+
+  defp eventually_value(fun, attempts \\ 50)
+
+  defp eventually_value(fun, attempts) when attempts > 0 do
+    case fun.() do
+      nil ->
+        Process.sleep(20)
+        eventually_value(fun, attempts - 1)
+
+      value ->
+        value
+    end
+  end
+
+  defp eventually_value(_fun, 0), do: nil
 
   defp write_attempt_workflow!(path, root, port) do
     File.write!(

@@ -19,13 +19,21 @@ GitHub Issues adapter:
   reservation before `Task.Supervisor.start_child/2` may run. The reservation
   is re-read and confirmed before launch.
 - A canonical, mode-restricted host-state root outside all issue workspaces
-  stores high-water and quarantine records. Symlinked roots/files and any
-  canonical overlap with the workspace root fail closed. High-water state can
-  only veto a regressed GitHub history; it never authorizes a start by itself.
+  stores high-water and quarantine records. The root is resolved against the
+  selected workflow, pre-existing insecure directories are rejected without
+  mode mutation, and original-path symlink components/files or any canonical
+  overlap with the workspace root fail closed. High-water state can only veto
+  a regressed GitHub history; it never authorizes a start by itself.
+- Every pre-launch local-state transition syncs file contents, atomically
+  renames, and syncs the parent directory before worker authorization. A sync
+  failure consumes no worker start.
 - Before handling exhaustion or any ledger failure, Symphony durably
   quarantines the issue. It then records one canonical evidence comment,
   removes only the configured activation label, and confirms absence. The
-  quarantine survives restart and is never cleared automatically.
+  quarantine survives restart and is never cleared automatically. Local and
+  remote barriers are attempted independently; if neither is established, the
+  outer singleton trips and polling remains suspended until an operator reset
+  and full service restart.
 - The fifth reservation still starts worker five. When that worker exits, the
   orchestrator deactivates the issue without attempting a sixth reservation.
 - The complete enabled fuse profile (budget, lock, tracker identity, repository,
@@ -35,6 +43,9 @@ GitHub Issues adapter:
 - GitHub's generic authenticated `github_api` dynamic tool is disabled for the
   ìwé workflow and unadvertised tool calls are rejected, so Codex and helper
   agents cannot use the tracker identity to forge or delete ledger evidence.
+  The frozen no-tools binding and tracker-secret scrub set are passed into the
+  worker and revalidated before workspace creation and after hooks, so a hot
+  reload cannot give an already-reserved session new tracker authority.
 
 ## Trust and availability boundary
 

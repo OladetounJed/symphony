@@ -2,6 +2,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.GitHub.AttemptLedger
+  alias SymphonyElixir.GitHub.AttemptLedger.DurableFileOps
 
   @repo "octo/repo"
   @repository_id 77
@@ -9,10 +10,20 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   @app_id 99
   @source_revision String.duplicate("a", 40)
 
+  defmodule FailingDirectorySync do
+    def sync(file), do: :file.sync(file)
+    def sync_directory(_path), do: {:error, :injected_directory_sync_failure}
+  end
+
+  defmodule FailingFileSync do
+    def sync(_file), do: {:error, :injected_file_sync_failure}
+    def sync_directory(_path), do: :ok
+  end
+
   setup do
     root =
       Path.join(
-        System.tmp_dir!(),
+        canonical_tmp_dir(),
         "symphony-attempt-ledger-#{System.unique_integer([:positive])}"
       )
 
@@ -23,7 +34,10 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     state =
       start_supervised!({Agent, &initial_remote_state/0})
 
-    on_exit(fn -> File.rm_rf(root) end)
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :attempt_ledger_file_ops)
+      File.rm_rf(root)
+    end)
 
     context = [
       root: root,
@@ -35,6 +49,17 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     ]
 
     {:ok, context}
+  end
+
+  test "durable file operations sync files and directory metadata", context do
+    path = Path.join(context.root, "durable-file-ops.json")
+    {:ok, file} = :file.open(String.to_charlist(path), [:write, :exclusive, :binary, :raw])
+
+    assert :ok = :file.write(file, "{}")
+    assert :ok = DurableFileOps.sync(file)
+    assert :ok = :file.close(file)
+    assert :ok = DurableFileOps.sync_directory(context.root)
+    assert {:error, :enoent} = DurableFileOps.sync_directory(Path.join(context.root, "missing"))
   end
 
   test "five reservations survive restart state and no sixth start is authorized", context do
@@ -166,6 +191,23 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert length(Agent.get(context.state, & &1.comments)) == 1
   end
 
+  test "a conflicting POST response id cannot confirm or launch a reservation", context do
+    base_request = request_fun(context.state)
+
+    request = fn method, path, params, body, settings ->
+      case base_request.(method, path, params, body, settings) do
+        {:ok, %{status: 201, body: comment} = response} when method == "POST" ->
+          {:ok, %{response | body: Map.put(comment, "id", comment["id"] + 1)}}
+
+        result ->
+          result
+      end
+    end
+
+    assert {:error, :github_attempt_post_id_mismatch} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
+  end
+
   test "a confirmed reservation fails closed if the final high-water target becomes a symlink", context do
     base_request = request_fun(context.state)
     injected = Path.join(context.workspace_root, "injected-high-water.json")
@@ -210,6 +252,19 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
 
     assert {:error, :github_attempt_quarantined} =
              reserve(context, request_fun(context.state))
+  end
+
+  test "an edited canonical trusted reservation is rejected before quarantine", context do
+    request = request_fun(context.state)
+    assert {:ok, %{used: 1}} = reserve(context, request)
+
+    Agent.update(context.state, fn state ->
+      [comment] = state.comments
+      edited = %{comment | "updated_at" => "2026-01-02T00:00:00Z"}
+      %{state | comments: [edited]}
+    end)
+
+    assert {:error, :github_attempt_comment_edited} = reserve(context, request)
   end
 
   test "untrusted marker comments are ignored and cannot consume the budget", context do
@@ -292,7 +347,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
 
     tracker_settings = tracker_settings(blocked_root)
 
-    assert {:error, :enotdir} =
+    assert {:error, :github_attempt_high_water_root_insecure} =
              AttemptLedger.reserve_for_test(
                context.issue,
                5,
@@ -304,15 +359,73 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert Agent.get(context.state, & &1.comments) == []
   end
 
+  test "a parent-directory sync failure cannot authorize a worker start", context do
+    Application.put_env(
+      :symphony_elixir,
+      :attempt_ledger_file_ops,
+      FailingDirectorySync
+    )
+
+    assert {:error, {:github_attempt_high_water_write, :injected_directory_sync_failure}} =
+             reserve(context, request_fun(context.state))
+
+    assert Agent.get(context.state, & &1.comments) == []
+  end
+
+  test "a file-content sync failure cannot authorize a worker start", context do
+    Application.put_env(:symphony_elixir, :attempt_ledger_file_ops, FailingFileSync)
+
+    assert {:error, {:github_attempt_high_water_write, :injected_file_sync_failure}} =
+             reserve(context, request_fun(context.state))
+
+    assert Agent.get(context.state, & &1.comments) == []
+  end
+
   test "a symlinked host-state root resolving inside the workspace is rejected", context do
     target = Path.join(context.workspace_root, "agent-controlled-state")
     File.mkdir_p!(target)
     File.ln_s!(target, context.high_water_root)
 
-    assert {:error, :github_attempt_high_water_inside_workspace} =
+    assert {:error, :github_attempt_high_water_symlink} =
              reserve(context, request_fun(context.state))
 
     assert Agent.get(context.state, & &1.comments) == []
+  end
+
+  test "a symlinked host-state root is rejected even when its target is otherwise safe", context do
+    target = Path.join(context.root, "safe-host-state-target")
+    File.mkdir_p!(target)
+    File.ln_s!(target, context.high_water_root)
+
+    assert {:error, :github_attempt_high_water_symlink} =
+             reserve(context, request_fun(context.state))
+
+    assert Agent.get(context.state, & &1.comments) == []
+  end
+
+  test "an insecure existing host-state directory is rejected without changing its mode", context do
+    File.mkdir_p!(context.high_water_root)
+    File.chmod!(context.high_water_root, 0o755)
+
+    assert {:error, :github_attempt_high_water_root_insecure} =
+             reserve(context, request_fun(context.state))
+
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(context.high_water_root)
+    assert Bitwise.band(mode, 0o777) == 0o755
+  end
+
+  test "retargeting the configured host-state path to a symlink fails closed", context do
+    request = request_fun(context.state)
+    assert {:ok, %{used: 1}} = reserve(context, request)
+
+    preserved = Path.join(context.root, "preserved-host-state")
+    replacement = Path.join(context.root, "replacement-host-state")
+    File.rename!(context.high_water_root, preserved)
+    File.mkdir_p!(replacement)
+    File.ln_s!(replacement, context.high_water_root)
+
+    assert {:error, :github_attempt_high_water_symlink} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
   end
 
   test "a symlinked high-water file is rejected before it can authorize a start", context do
@@ -383,7 +496,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
              )
 
     first_call_count = length(Agent.get(context.state, & &1.calls))
-    assert {:error, :github_attempt_quarantined} = reserve(context, request)
+    [quarantine_path] = Path.wildcard(Path.join(context.high_water_root, "*.quarantine.json"))
+    assert {:ok, %File.Stat{type: :regular, mode: quarantine_mode}} = File.stat(quarantine_path)
+    assert Bitwise.band(quarantine_mode, 0o077) == 0
+
+    fresh_process = Task.async(fn -> reserve(context, request) end)
+    assert {:error, :github_attempt_quarantined} = Task.await(fresh_process)
     assert length(Agent.get(context.state, & &1.calls)) == first_call_count
 
     assert {:error, {:attempt_deactivation_failed, _, _, _}} =
@@ -412,6 +530,45 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
 
     assert is_integer(exhaustion_post) and is_integer(label_delete)
     assert exhaustion_post < label_delete
+  end
+
+  test "remote deactivation still runs when local quarantine cannot be written", context do
+    File.mkdir_p!(context.high_water_root)
+    File.chmod!(context.high_water_root, 0o700)
+    quarantine_path = Path.join(context.high_water_root, "77-4242.quarantine.json")
+    File.mkdir_p!(quarantine_path)
+
+    assert {:error, {:deactivated_without_quarantine, :github_attempt_quarantine_malformed, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "local_storage_failed"},
+               context.tracker_settings,
+               request_fun(context.state),
+               workspace_root: context.workspace_root
+             )
+
+    remote = Agent.get(context.state, & &1)
+    refute "pilot:symphony" in remote.labels
+    assert Enum.count(remote.comments, &String.starts_with?(&1["body"], exhaustion_marker())) == 1
+  end
+
+  test "local and remote deactivation failure is reported as unfenced", context do
+    File.mkdir_p!(context.high_water_root)
+    File.chmod!(context.high_water_root, 0o700)
+    quarantine_path = Path.join(context.high_water_root, "77-4242.quarantine.json")
+    File.mkdir_p!(quarantine_path)
+    Agent.update(context.state, &%{&1 | delete_mode: :error})
+
+    assert {:error, {:attempt_deactivation_unfenced, :github_attempt_quarantine_malformed, _, _, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "all_barriers_failed"},
+               context.tracker_settings,
+               request_fun(context.state),
+               workspace_root: context.workspace_root
+             )
+
+    assert "pilot:symphony" in Agent.get(context.state, & &1.labels)
   end
 
   test "an oversized comment page fails closed", context do
@@ -612,5 +769,11 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   end
 
   defp attempt_marker, do: "<!-- iwe-symphony-attempt:v1 -->\n"
+
+  defp canonical_tmp_dir do
+    {:ok, path} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    path
+  end
+
   defp exhaustion_marker, do: "<!-- iwe-symphony-exhaustion:v1 -->\n"
 end

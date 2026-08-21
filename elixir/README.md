@@ -178,7 +178,14 @@ Notes:
   complete fuse profile outside the inner task/orchestrator restart domain; any fuse-setting reload
   drift denies dispatch until a full reviewed service restart.
 - The host-state root is canonicalized, restricted to owner access, and must be disjoint from the
-  canonical workspace root. Symlinked host-state components or files fail closed.
+  workflow-relative canonical workspace root. Symlinked host-state components or files and
+  insecure pre-existing directories fail closed without changing their permissions. Local state is
+  file-synced, atomically renamed, and directory-synced before launch authorization.
+- Local quarantine and remote label removal are independent barriers. Failure to establish either
+  trips the outer singleton and suspends polling until an explicit operator reset and full restart.
+- The frozen no-tools binding and tracker-secret scrub set are passed through worker startup and
+  revalidated after hooks, preventing reload drift from granting an already-reserved session new
+  tracker authority.
 - Reservation five may run. Its exit triggers durable quarantine, one exhaustion evidence record,
   activation-label removal, and confirmation without a sixth reservation.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue

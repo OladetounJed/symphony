@@ -397,7 +397,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   end
 
   test "attempt-ledger workflows do not advertise or execute the generic authenticated GitHub tool" do
-    high_water_root = Path.join(System.tmp_dir!(), "symphony-ledger-host-state")
+    {:ok, temporary_root} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    high_water_root = Path.join(temporary_root, "symphony-ledger-host-state")
 
     File.write!(
       Workflow.workflow_file_path(),

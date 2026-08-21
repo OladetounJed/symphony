@@ -7,7 +7,7 @@ defmodule SymphonyElixir.AttemptFuse do
   drift is rejected before dispatch.
   """
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Workflow}
   alias SymphonyElixir.Config.Schema
 
   @type snapshot :: %{
@@ -20,12 +20,17 @@ defmodule SymphonyElixir.AttemptFuse do
 
   @spec snapshot(Schema.t()) :: snapshot()
   def snapshot(%Schema{} = settings) do
+    workflow_directory =
+      Workflow.workflow_file_path()
+      |> Path.expand()
+      |> Path.dirname()
+
     %{
       enabled: is_integer(settings.agent.max_attempts),
       max_attempts: settings.agent.max_attempts,
       instance_lock_port: settings.agent.instance_lock_port,
       tracker_settings: settings.tracker,
-      workspace_root: settings.workspace.root
+      workspace_root: Path.expand(settings.workspace.root, workflow_directory)
     }
   end
 
