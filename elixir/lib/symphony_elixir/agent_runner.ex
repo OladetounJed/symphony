@@ -47,11 +47,19 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     attempt_fuse = Keyword.get(opts, :attempt_fuse)
+    execution_settings = Keyword.fetch!(opts, :execution_settings)
 
     with :ok <- validate_attempt_fuse(attempt_fuse),
          {:ok, workspace} <- workspace_module().create_for_issue(issue, worker_host, attempt_fuse),
          :ok <- validate_attempt_fuse(attempt_fuse) do
-      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+      send_worker_runtime_info(
+        codex_update_recipient,
+        issue,
+        worker_host,
+        workspace,
+        attempt_fuse,
+        execution_settings
+      )
 
       try do
         with :ok <-
@@ -87,21 +95,59 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+  defp send_worker_runtime_info(
+         recipient,
+         %Issue{id: issue_id},
+         worker_host,
+         workspace,
+         attempt_fuse,
+         execution_settings
+       )
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) and
+              is_map(execution_settings) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         workspace_root: runtime_workspace_root(workspace, worker_host, attempt_fuse, execution_settings),
+         workspace_hooks: execution_settings.hooks
        }}
     )
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(
+         _recipient,
+         _issue,
+         _worker_host,
+         _workspace,
+         _attempt_fuse,
+         _execution_settings
+       ),
+       do: :ok
+
+  defp runtime_workspace_root(
+         _workspace,
+         nil,
+         %{enabled: true, workspace_root: workspace_root},
+         _execution_settings
+       ),
+       do: workspace_root
+
+  defp runtime_workspace_root(
+         _workspace,
+         worker_host,
+         %{enabled: true},
+         execution_settings
+       )
+       when is_binary(worker_host),
+       do: execution_settings.workspace.root
+
+  defp runtime_workspace_root(workspace, _worker_host, _attempt_fuse, _execution_settings),
+    do: Path.dirname(workspace)
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     execution_settings = Keyword.fetch!(opts, :execution_settings)

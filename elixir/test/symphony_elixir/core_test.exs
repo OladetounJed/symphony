@@ -653,6 +653,8 @@ defmodule SymphonyElixir.CoreTest do
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
       )
 
+      old_hooks = Config.settings!().hooks
+
       File.mkdir_p!(old_workspace)
       File.mkdir_p!(new_workspace)
 
@@ -671,6 +673,8 @@ defmodule SymphonyElixir.CoreTest do
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
             workspace_path: old_workspace,
+            workspace_root: old_root,
+            workspace_hooks: old_hooks,
             started_at: DateTime.utc_now()
           }
         },

@@ -222,7 +222,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, canonical_recorded_root} =
                SymphonyElixir.PathSafety.canonicalize(recorded_root)
 
+      hooks = Config.settings!().hooks
+
       assert {:error, {:workspace_symlink_escape, ^recorded_workspace, ^canonical_recorded_root}, ""} =
+               Workspace.remove_recorded(recorded_workspace, nil, recorded_root, hooks)
+
+      assert {:error, {:workspace_path_unreadable, ^recorded_workspace, :workspace_root_required}, ""} =
                Workspace.remove_recorded(recorded_workspace, nil)
 
       refute File.exists?(hook_marker)

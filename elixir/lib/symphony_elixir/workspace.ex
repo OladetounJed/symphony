@@ -231,39 +231,56 @@ defmodule SymphonyElixir.Workspace do
 
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, nil) when is_binary(workspace) do
-    if Path.type(workspace) == :absolute do
-      case validate_recorded_workspace_path(workspace) do
-        :ok ->
-          remove_local_workspace(workspace)
+  def remove_recorded(workspace, _worker_host),
+    do: {:error, {:workspace_path_unreadable, workspace, :workspace_root_required}, ""}
 
-        {:error, reason} ->
-          {:error, reason, ""}
-      end
-    else
-      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host(), Path.t(), map()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, worker_host, workspace_root, hooks)
+      when is_binary(workspace) and is_binary(workspace_root) and is_map(hooks) do
+    case validate_recorded_cleanup_inputs(workspace, worker_host, workspace_root) do
+      :ok -> do_remove_recorded(workspace, worker_host, workspace_root, hooks)
+      {:error, reason} -> {:error, reason, ""}
     end
   end
 
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    if Path.type(workspace) == :absolute do
-      remove_remote_workspace(
-        workspace,
-        worker_host,
-        Path.dirname(workspace),
-        Config.settings!().hooks
-      )
-    else
-      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+  def remove_recorded(workspace, _worker_host, _workspace_root, _hooks) do
+    {:error, {:workspace_path_unreadable, workspace, :invalid_cleanup_authority}, ""}
+  end
+
+  defp do_remove_recorded(workspace, nil, workspace_root, hooks) do
+    case validate_local_workspace_path(workspace, workspace_root) do
+      :ok -> remove_local_workspace(workspace, hooks)
+      {:error, reason} -> {:error, reason, ""}
     end
   end
 
-  def remove_recorded(workspace, _worker_host) do
-    {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+  defp do_remove_recorded(workspace, worker_host, workspace_root, hooks) do
+    remove_remote_workspace(workspace, worker_host, workspace_root, hooks)
   end
 
-  defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
+  defp validate_recorded_cleanup_inputs(workspace, worker_host, workspace_root) do
+    cond do
+      Path.type(workspace) != :absolute ->
+        {:error, {:workspace_path_unreadable, workspace, :not_absolute}}
+
+      Path.type(workspace_root) != :absolute ->
+        {:error, {:workspace_path_unreadable, workspace_root, :root_not_absolute}}
+
+      not (is_nil(worker_host) or is_binary(worker_host)) ->
+        {:error, {:workspace_path_unreadable, workspace, :invalid_worker_host}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp remove_local_workspace(workspace),
+    do: remove_local_workspace(workspace, Config.settings!().hooks)
+
+  defp remove_local_workspace(workspace, hooks) do
+    maybe_run_before_remove_hook(workspace, nil, hooks)
     File.rm_rf(workspace)
   end
 
@@ -499,9 +516,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_before_remove_hook(workspace, nil) do
-    hooks = Config.settings!().hooks
-
+  defp maybe_run_before_remove_hook(workspace, nil, hooks) do
     case File.dir?(workspace) do
       true ->
         case hooks.before_remove do
@@ -514,7 +529,9 @@ defmodule SymphonyElixir.Workspace do
               workspace,
               %{issue_id: nil, issue_identifier: Path.basename(workspace)},
               "before_remove",
-              nil
+              nil,
+              hooks.timeout_ms,
+              Path.dirname(workspace)
             )
             |> ignore_hook_failure()
         end
@@ -542,7 +559,7 @@ defmodule SymphonyElixir.Workspace do
           ]
           |> Enum.join("\n")
 
-        run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
+        run_remote_command(worker_host, script, hooks.timeout_ms)
         |> case do
           {:ok, {output, status}} ->
             handle_hook_command_result(
@@ -564,18 +581,6 @@ defmodule SymphonyElixir.Workspace do
 
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
-
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) do
-    run_hook(
-      command,
-      workspace,
-      issue_context,
-      hook_name,
-      worker_host,
-      Config.settings!().hooks.timeout_ms,
-      current_workspace_root(worker_host)
-    )
-  end
 
   defp run_hook(command, workspace, issue_context, hook_name, nil, timeout_ms, _workspace_root) do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
@@ -752,10 +757,6 @@ defmodule SymphonyElixir.Workspace do
       true ->
         :ok
     end
-  end
-
-  defp validate_recorded_workspace_path(workspace) when is_binary(workspace) do
-    validate_local_workspace_path(workspace, Path.dirname(workspace))
   end
 
   defp validate_local_workspace_path(workspace, workspace_root)

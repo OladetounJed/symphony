@@ -182,6 +182,8 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:workspace_root, runtime_info[:workspace_root])
+          |> maybe_put_runtime_value(:workspace_hooks, runtime_info[:workspace_hooks])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -260,6 +262,8 @@ defmodule SymphonyElixir.Orchestrator do
           delay_type: :continuation,
           worker_host: Map.get(running_entry, :worker_host),
           workspace_path: Map.get(running_entry, :workspace_path),
+          workspace_root: Map.get(running_entry, :workspace_root),
+          workspace_hooks: Map.get(running_entry, :workspace_hooks),
           attempt_usage: Map.get(running_entry, :attempt_usage)
         })
     end
@@ -305,6 +309,8 @@ defmodule SymphonyElixir.Orchestrator do
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root),
+      workspace_hooks: Map.get(running_entry, :workspace_hooks),
       attempt_usage: Map.get(running_entry, :attempt_usage)
     })
   end
@@ -860,6 +866,8 @@ defmodule SymphonyElixir.Orchestrator do
       issue: Map.get(running_entry, :issue),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root),
+      workspace_hooks: Map.get(running_entry, :workspace_hooks),
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
@@ -1235,6 +1243,8 @@ defmodule SymphonyElixir.Orchestrator do
         issue: issue,
         worker_host: worker_host,
         workspace_path: nil,
+        workspace_root: nil,
+        workspace_hooks: nil,
         session_id: nil,
         last_codex_message: nil,
         last_codex_timestamp: nil,
@@ -1424,6 +1434,8 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    workspace_root = pick_retry_workspace_root(previous_retry, metadata)
+    workspace_hooks = pick_retry_workspace_hooks(previous_retry, metadata)
 
     attempt_usage =
       Map.get(
@@ -1455,6 +1467,8 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
+            workspace_root: workspace_root,
+            workspace_hooks: workspace_hooks,
             attempt_usage: attempt_usage
           })
     }
@@ -1469,6 +1483,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
+          workspace_root: Map.get(retry_entry, :workspace_root),
+          workspace_hooks: Map.get(retry_entry, :workspace_hooks),
           attempt_usage: Map.get(retry_entry, :attempt_usage)
         }
 
@@ -1529,7 +1545,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     case Map.get(metadata, :workspace_path) do
       workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+        Workspace.remove_recorded(
+          workspace_path,
+          Map.get(metadata, :worker_host),
+          Map.get(metadata, :workspace_root),
+          Map.get(metadata, :workspace_hooks)
+        )
 
       _ ->
         cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
@@ -1668,6 +1689,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_workspace_root(previous_retry, metadata) do
+    metadata[:workspace_root] || Map.get(previous_retry, :workspace_root)
+  end
+
+  defp pick_retry_workspace_hooks(previous_retry, metadata) do
+    metadata[:workspace_hooks] || Map.get(previous_retry, :workspace_hooks)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry

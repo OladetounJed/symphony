@@ -477,7 +477,12 @@ defmodule SymphonyElixir.AttemptFuseTest do
     assert trace_after_create =~ hook
 
     assert {:error, {:remote_workspace_validation_failed, :outside_root, ^remote_root, "/home/worker"}, ""} =
-             Workspace.remove_recorded(remote_workspace, "worker-01")
+             Workspace.remove_recorded(
+               remote_workspace,
+               "worker-01",
+               remote_root,
+               frozen.execution_settings.hooks
+             )
 
     cleanup_trace = File.read!(trace) |> String.replace(trace_after_create, "")
     refute cleanup_trace =~ "rm -rf"
@@ -537,9 +542,10 @@ defmodule SymphonyElixir.AttemptFuseTest do
     File.chmod!(fake_ssh, 0o755)
     write_attempt_workflow!(workflow_path, root, port, remote_root)
     assert :ok = WorkflowStore.force_reload()
+    hooks = Config.settings!().hooks
 
     assert {:error, {:workspace_remove_failed, "worker-01", 74, _output}, ""} =
-             Workspace.remove_recorded(remote_workspace, "worker-01")
+             Workspace.remove_recorded(remote_workspace, "worker-01", remote_root, hooks)
 
     assert File.read!(outside_marker) == "keep"
     assert {:ok, %File.Stat{type: :symlink}} = File.lstat(remote_workspace)

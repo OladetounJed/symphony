@@ -436,7 +436,17 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
 
     assert_receive {:workspace_create, "frozen-worker", execution_settings}
     assert execution_settings == frozen.execution_settings
-    assert_receive {:worker_runtime_info, _, %{worker_host: "frozen-worker"}}
+    frozen_hooks = execution_settings.hooks
+    frozen_workspace_root = execution_settings.workspace.root
+
+    assert_receive {:worker_runtime_info, _,
+                    %{
+                      worker_host: "frozen-worker",
+                      workspace_path: "/tmp/frozen-agent-runner-workspace",
+                      workspace_root: ^frozen_workspace_root,
+                      workspace_hooks: ^frozen_hooks
+                    }}
+
     assert_receive {:workspace_before_run, _, "frozen-worker", ^execution_settings}
 
     assert_receive {:app_server_start, _, "frozen-worker", ^execution_settings, ^binding}
