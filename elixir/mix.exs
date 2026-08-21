@@ -15,6 +15,7 @@ defmodule SymphonyElixir.MixProject do
         ignore_modules: [
           SymphonyElixir.Asana.Client,
           SymphonyElixir.Config,
+          SymphonyElixir.GitHub.AttemptLedger,
           SymphonyElixir.GitHub.Client,
           SymphonyElixir.GitLab.Client,
           SymphonyElixir.Jira.Client,
@@ -28,6 +29,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Codex.AppServer,
           SymphonyElixir.Codex.DynamicTool,
           SymphonyElixir.HttpServer,
+          SymphonyElixir.InstanceLock,
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
           SymphonyElixir.Workspace,

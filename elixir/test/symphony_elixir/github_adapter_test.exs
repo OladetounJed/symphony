@@ -396,6 +396,55 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert :ok = Config.validate!()
   end
 
+  test "attempt-ledger workflows do not advertise or execute the generic authenticated GitHub tool" do
+    high_water_root = Path.join(System.tmp_dir!(), "symphony-ledger-host-state")
+
+    File.write!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        provider:
+          repo: "octo/repo"
+          token: "test-token"
+          agent_tools_enabled: false
+          attempt_ledger:
+            enabled: false
+            repository_id: 77
+            actor_id: 0
+            app_id: 0
+            activation_label: "pilot:symphony"
+            source_revision: "#{String.duplicate("a", 40)}"
+            high_water_root: "#{high_water_root}"
+        active_states: ["open"]
+        terminal_states: ["closed"]
+      ---
+
+      You are working on {{ issue.identifier }}.
+      """
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    binding = Tracker.bind_agent_tools()
+
+    assert binding.tool_specs == []
+    assert binding.allowed_tool_names == MapSet.new()
+
+    response =
+      Tracker.execute_bound_agent_tool(
+        binding,
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/comments/1"},
+        github_client: fn _method, _path, _params, _body, _opts ->
+          flunk("a disabled dynamic tool must not reach the authenticated GitHub client")
+        end
+      )
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["supportedTools"] == []
+  end
+
   defp tracker_settings(provider_overrides \\ %{}) do
     %{
       kind: "github",

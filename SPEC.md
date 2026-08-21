@@ -452,6 +452,15 @@ Fields:
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
   - Invalid values fail configuration validation.
+- `max_attempts` (optional positive integer; downstream extension)
+  - Counts total top-level worker process starts for one issue, including initial dispatch,
+    continuation, failure, stall, and spawn-failure recovery.
+  - A durable provider reservation MUST be confirmed before process launch.
+  - Exhausted, unavailable, malformed, conflicting, or unconfirmed evidence MUST start no worker.
+- `instance_lock_port` (optional positive integer; downstream extension)
+  - Required with `max_attempts` by the ìwé GitHub profile.
+  - Holds a loopback socket for the agent runtime lifetime so a second service on the same host
+    fails before polling. It is not a multi-host lease.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -623,6 +632,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_attempts`: optional positive integer (downstream extension)
+- `agent.instance_lock_port`: optional loopback port paired with `max_attempts` (downstream extension)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined

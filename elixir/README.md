@@ -165,6 +165,12 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- The ìwé downstream fork optionally supports `agent.max_attempts`. When configured for the GitHub
+  adapter, it counts every top-level worker process start, including initial dispatch, continuation,
+  failure, stall, and spawn-failure recovery. It requires `agent.instance_lock_port` and a configured
+  `tracker.provider.attempt_ledger`; missing or invalid durable evidence fails closed.
+- `agent.instance_lock_port` is a host-local singleton fence, not multi-host coordination. The
+  downstream pilot supports one service instance on one host only.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -255,6 +261,16 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+- Downstream attempt-ledger workflows set `tracker.provider.agent_tools_enabled: false`. This removes
+  `github_api` from the App Server session and rejects execution even if an unadvertised call is
+  attempted. The host-only ledger still uses the tracker client through exact issue-comment and
+  activation-label operations.
+- The downstream `tracker.provider.attempt_ledger` object contains `enabled`, immutable
+  `repository_id`, immutable bot `actor_id`, immutable GitHub `app_id`, `activation_label`, the exact
+  40-character downstream `source_revision`, and an absolute or `$ENV` `high_water_root` outside all
+  issue workspaces. Enabled ledgers require positive actor/App IDs; disabled pilot configuration
+  remains non-runnable and may use zero sentinels until a reviewed activation change supplies the
+  real identities.
 
 ### Jira Cloud adapter
 

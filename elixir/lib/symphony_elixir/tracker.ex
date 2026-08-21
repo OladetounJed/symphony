@@ -25,9 +25,14 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback reserve_attempt(Issue.t(), pos_integer()) ::
+              {:ok, map()} | {:exhausted, map()} | {:error, term()}
+  @callback deactivate_attempts(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
+                      reserve_attempt: 2,
+                      deactivate_attempts: 2,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -49,28 +54,62 @@ defmodule SymphonyElixir.Tracker do
   def bind_agent_tools do
     tracker_settings = Config.settings!().tracker
     adapter = adapter_for_settings!(tracker_settings)
+    tool_specs = configured_agent_tool_specs(adapter, tracker_settings)
 
     %{
       adapter: adapter,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
+      tool_specs: tool_specs,
+      allowed_tool_names: MapSet.new(Enum.map(tool_specs, & &1["name"])),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
     }
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
   def execute_bound_agent_tool(
-        %{adapter: adapter, tracker_settings: tracker_settings},
+        %{
+          adapter: adapter,
+          tracker_settings: tracker_settings,
+          allowed_tool_names: allowed_tool_names
+        },
         tool,
         arguments,
         opts \\ []
       ) do
-    execute_agent_tool_with_adapter(
-      adapter,
-      tool,
-      arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
-    )
+    if is_binary(tool) and MapSet.member?(allowed_tool_names, tool) do
+      execute_agent_tool_with_adapter(
+        adapter,
+        tool,
+        arguments,
+        Keyword.put(opts, :tracker_settings, tracker_settings)
+      )
+    else
+      unsupported_agent_tool_response(tool)
+    end
+  end
+
+  @spec reserve_attempt(Issue.t(), pos_integer()) ::
+          {:ok, map()} | {:exhausted, map()} | {:error, term()}
+  def reserve_attempt(%Issue{} = issue, max_attempts)
+      when is_integer(max_attempts) and max_attempts > 0 do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :reserve_attempt, 2) do
+      adapter.reserve_attempt(issue, max_attempts)
+    else
+      {:error, :attempt_ledger_unsupported}
+    end
+  end
+
+  @spec deactivate_attempts(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def deactivate_attempts(%Issue{} = issue, evidence) when is_map(evidence) do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :deactivate_attempts, 2) do
+      adapter.deactivate_attempts(issue, evidence)
+    else
+      {:error, :attempt_deactivation_unsupported}
+    end
   end
 
   @spec validate_config(map()) :: :ok | {:error, term()}
@@ -108,6 +147,13 @@ defmodule SymphonyElixir.Tracker do
       adapter.agent_tool_specs()
     else
       []
+    end
+  end
+
+  defp configured_agent_tool_specs(adapter, tracker_settings) do
+    case tracker_settings do
+      %{provider: %{"agent_tools_enabled" => false}} -> []
+      _ -> adapter_agent_tool_specs(adapter)
     end
   end
 

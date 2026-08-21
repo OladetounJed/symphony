@@ -34,6 +34,23 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
 
+    write_workflow_file!(Workflow.workflow_file_path(), max_attempts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_attempts"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_attempts: 5)
+    assert {:error, :max_attempts_requires_instance_lock} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), instance_lock_port: 4041)
+    assert {:error, :instance_lock_requires_max_attempts} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_attempts: 5,
+      instance_lock_port: 4041
+    )
+
+    assert {:error, :max_attempts_requires_github_attempt_ledger} = Config.validate!()
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"

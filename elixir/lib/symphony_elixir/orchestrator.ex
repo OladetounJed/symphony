@@ -33,12 +33,15 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :instance_lock_port,
+      :max_attempts,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      attempt_usage: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -64,6 +67,8 @@ defmodule SymphonyElixir.Orchestrator do
           poll_check_in_progress: false,
           tick_timer_ref: nil,
           tick_token: nil,
+          instance_lock_port: config.agent.instance_lock_port,
+          max_attempts: config.agent.max_attempts,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -951,13 +956,73 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case reserve_worker_start(issue) do
+      {:ok, attempt_evidence} ->
+        start_reserved_worker(
+          state,
+          issue,
+          attempt,
+          attempt_evidence,
+          recipient,
+          worker_host
+        )
+
+      {:exhausted, attempt_evidence} ->
+        block_attempt_dispatch(
+          state,
+          issue,
+          {:max_attempts_exhausted, attempt_evidence},
+          attempt_evidence
+        )
+
+      {:error, reason} ->
+        block_attempt_dispatch(state, issue, {:attempt_reservation_failed, reason}, %{
+          used: nil,
+          max: Config.settings!().agent.max_attempts,
+          remaining: nil,
+          exhausted: false,
+          reservation_id: nil,
+          evidence_url: nil,
+          tip_comment_id: nil,
+          tip_digest: nil,
+          observed_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+        })
+    end
+  end
+
+  defp reserve_worker_start(issue) do
+    case Config.settings!().agent.max_attempts do
+      nil -> {:ok, nil}
+      max_attempts -> Tracker.reserve_attempt(issue, max_attempts)
+    end
+  end
+
+  defp start_reserved_worker(
+         %State{} = state,
+         issue,
+         retry_attempt,
+         attempt_evidence,
+         recipient,
+         worker_host
+       ) do
+    prompt_attempt =
+      case attempt_evidence do
+        %{used: used} when is_integer(used) and used > 0 -> used
+        _ -> retry_attempt
+      end
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: prompt_attempt,
+             worker_host: worker_host
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+        Logger.info(
+          "Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} retry_attempt=#{inspect(retry_attempt)} durable_attempt=#{inspect(prompt_attempt)} worker_host=#{worker_host || "local"}"
+        )
 
         running =
           Map.put(state.running, issue.id, %{
@@ -979,7 +1044,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
+            retry_attempt: normalize_retry_attempt(retry_attempt),
+            attempt_usage: attempt_evidence,
             started_at: DateTime.utc_now()
           })
 
@@ -987,12 +1053,13 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            attempt_usage: put_attempt_usage(state.attempt_usage, issue.id, attempt_evidence)
         }
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+        next_attempt = if is_integer(retry_attempt), do: retry_attempt + 1, else: nil
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
@@ -1001,6 +1068,47 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp block_attempt_dispatch(%State{} = state, issue, reason, attempt_evidence) do
+    deactivation_evidence =
+      attempt_evidence
+      |> Map.put(:reason, inspect(reason))
+      |> Map.put_new(:max, Config.settings!().agent.max_attempts)
+
+    deactivation = Tracker.deactivate_attempts(issue, deactivation_evidence)
+
+    blocked_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      error: {reason, deactivation},
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil,
+      attempt_usage: attempt_evidence
+    }
+
+    Logger.error("Blocking agent dispatch for #{issue_context(issue)} reason=#{inspect(reason)} deactivation=#{inspect(deactivation)}")
+
+    %{
+      state
+      | running: Map.delete(state.running, issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id),
+        blocked: Map.put(state.blocked, issue.id, blocked_entry),
+        attempt_usage: put_attempt_usage(state.attempt_usage, issue.id, attempt_evidence)
+    }
+  end
+
+  defp put_attempt_usage(attempt_usage, _issue_id, nil), do: attempt_usage
+
+  defp put_attempt_usage(attempt_usage, issue_id, evidence) when is_map(evidence) do
+    Map.put(attempt_usage, issue_id, evidence)
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1427,6 +1535,7 @@ defmodule SymphonyElixir.Orchestrator do
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
           turn_count: Map.get(metadata, :turn_count, 0),
+          attempt_usage: Map.get(metadata, :attempt_usage),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
@@ -1465,7 +1574,8 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          attempt_usage: Map.get(metadata, :attempt_usage)
         }
       end)
 
@@ -1474,6 +1584,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       attempt_usage: state.attempt_usage,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1631,6 +1742,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
+
+    if state.instance_lock_port != config.agent.instance_lock_port or
+         state.max_attempts != config.agent.max_attempts do
+      raise "agent attempt-fuse settings changed; restarting the one-for-all runtime is required"
+    end
 
     %{
       state

@@ -19,6 +19,7 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
     orchestrator_name = Keyword.get(opts, :orchestrator_name, SymphonyElixir.Orchestrator)
 
     children = [
+      SymphonyElixir.InstanceLock,
       Supervisor.child_spec(
         {Task.Supervisor, name: task_supervisor_name},
         id: task_supervisor_name

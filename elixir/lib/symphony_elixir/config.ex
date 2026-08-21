@@ -119,9 +119,32 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      Tracker.validate_config(settings.tracker)
+      with :ok <- Tracker.validate_config(settings.tracker) do
+        validate_attempt_fuse(settings)
+      end
     end
   end
+
+  defp validate_attempt_fuse(%Schema{agent: %{max_attempts: nil, instance_lock_port: nil}}),
+    do: :ok
+
+  defp validate_attempt_fuse(%Schema{
+         tracker: %{kind: "github", provider: %{"attempt_ledger" => %{}}},
+         agent: %{max_attempts: max_attempts, instance_lock_port: instance_lock_port}
+       })
+       when is_integer(max_attempts) and max_attempts > 0 and is_integer(instance_lock_port) and
+              instance_lock_port > 0 do
+    :ok
+  end
+
+  defp validate_attempt_fuse(%Schema{agent: %{max_attempts: nil}}),
+    do: {:error, :instance_lock_requires_max_attempts}
+
+  defp validate_attempt_fuse(%Schema{agent: %{instance_lock_port: nil}}),
+    do: {:error, :max_attempts_requires_instance_lock}
+
+  defp validate_attempt_fuse(_settings),
+    do: {:error, :max_attempts_requires_github_attempt_ledger}
 
   defp format_config_error(reason) do
     case reason do
