@@ -39,3 +39,9 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+## ìwé downstream fork
+
+The `OladetounJed/symphony` fork carries a narrowly scoped, dispatch-disabled
+total-attempt safety delta for the ìwé pilot. Its additional invariants and
+rollback boundary are documented in [IWE_FORK.md](IWE_FORK.md).

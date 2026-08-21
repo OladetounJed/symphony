@@ -21,6 +21,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          attempt_usage: Map.get(snapshot, :attempt_usage, %{}),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -74,7 +75,8 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       attempts: %{
         restart_count: restart_count(retry),
-        current_retry_attempt: retry_attempt(retry)
+        current_retry_attempt: retry_attempt(retry),
+        durable: durable_attempt_usage(running, retry, blocked)
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
@@ -95,6 +97,10 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
+  defp durable_attempt_usage(running, retry, blocked) do
+    Map.get(running || retry || blocked || %{}, :attempt_usage)
+  end
+
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
   defp issue_status(nil, nil, _blocked), do: "blocked"
@@ -109,6 +115,7 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
+      attempt_usage: Map.get(entry, :attempt_usage),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
@@ -145,6 +152,7 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       blocked_at: iso8601(entry.blocked_at),
+      attempt_usage: Map.get(entry, :attempt_usage),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
@@ -157,6 +165,7 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
+      attempt_usage: Map.get(running, :attempt_usage),
       state: running.state,
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
@@ -187,6 +196,7 @@ defmodule SymphonyElixirWeb.Presenter do
       session_id: blocked.session_id,
       state: blocked.state,
       error: blocked.error,
+      attempt_usage: Map.get(blocked, :attempt_usage),
       blocked_at: iso8601(blocked.blocked_at),
       last_event: blocked.last_codex_event,
       last_message: summarize_message(blocked.last_codex_message),

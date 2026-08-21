@@ -10,8 +10,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
   end
 
-  @spec bind() :: map()
-  def bind do
-    Tracker.bind_agent_tools()
+  @spec bind(map() | struct()) :: map()
+  def bind(tracker_settings \\ SymphonyElixir.Config.settings!().tracker) do
+    Tracker.bind_agent_tools(tracker_settings)
   end
 end

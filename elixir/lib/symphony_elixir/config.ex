@@ -101,15 +101,22 @@ defmodule SymphonyElixir.Config do
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
     with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        {:ok,
-         %{
-           approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
-         }}
-      end
+      codex_runtime_settings_from(settings, workspace, opts)
+    end
+  end
+
+  @doc false
+  @spec codex_runtime_settings_from(Schema.t(), Path.t() | nil, keyword()) ::
+          {:ok, codex_runtime_settings()} | {:error, term()}
+  def codex_runtime_settings_from(%Schema{} = settings, workspace \\ nil, opts \\ []) do
+    with {:ok, turn_sandbox_policy} <-
+           Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+      {:ok,
+       %{
+         approval_policy: settings.codex.approval_policy,
+         thread_sandbox: settings.codex.thread_sandbox,
+         turn_sandbox_policy: turn_sandbox_policy
+       }}
     end
   end
 
@@ -119,9 +126,32 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      Tracker.validate_config(settings.tracker)
+      with :ok <- Tracker.validate_config(settings.tracker) do
+        validate_attempt_fuse(settings)
+      end
     end
   end
+
+  defp validate_attempt_fuse(%Schema{agent: %{max_attempts: nil, instance_lock_port: nil}}),
+    do: :ok
+
+  defp validate_attempt_fuse(%Schema{
+         tracker: %{kind: "github", provider: %{"attempt_ledger" => %{}}},
+         agent: %{max_attempts: max_attempts, instance_lock_port: instance_lock_port}
+       })
+       when is_integer(max_attempts) and max_attempts > 0 and is_integer(instance_lock_port) and
+              instance_lock_port > 0 do
+    :ok
+  end
+
+  defp validate_attempt_fuse(%Schema{agent: %{max_attempts: nil}}),
+    do: {:error, :instance_lock_requires_max_attempts}
+
+  defp validate_attempt_fuse(%Schema{agent: %{instance_lock_port: nil}}),
+    do: {:error, :max_attempts_requires_instance_lock}
+
+  defp validate_attempt_fuse(_settings),
+    do: {:error, :max_attempts_requires_github_attempt_ledger}
 
   defp format_config_error(reason) do
     case reason do

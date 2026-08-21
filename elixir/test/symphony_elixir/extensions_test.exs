@@ -219,6 +219,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              "success"
            ] == false
 
+    unsupported_binding = %{binding | allowed_tool_names: MapSet.new(["missing_memory_tool"])}
+
+    assert SymphonyElixir.Tracker.execute_bound_agent_tool(
+             unsupported_binding,
+             "missing_memory_tool",
+             %{}
+           )["success"] == false
+
     assert {:error, {:unsupported_tracker_kind, "future-tracker"}} =
              SymphonyElixir.Tracker.adapter_for_kind("future-tracker")
 
@@ -273,6 +281,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
                  "turn_count" => 7,
+                 "attempt_usage" => %{
+                   "used" => 2,
+                   "max" => 5,
+                   "remaining" => 3,
+                   "exhausted" => false
+                 },
                  "last_event" => "notification",
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
@@ -303,11 +317,31 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => "/workspaces/MT-BLOCKED",
                  "session_id" => "thread-blocked",
                  "blocked_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("blocked_at"),
+                 "attempt_usage" => %{
+                   "used" => 5,
+                   "max" => 5,
+                   "remaining" => 0,
+                   "exhausted" => true
+                 },
                  "last_event" => "turn_input_required",
                  "last_message" => "turn blocked: waiting for user input",
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "attempt_usage" => %{
+               "issue-http" => %{
+                 "used" => 2,
+                 "max" => 5,
+                 "remaining" => 3,
+                 "exhausted" => false
+               },
+               "issue-blocked" => %{
+                 "used" => 5,
+                 "max" => 5,
+                 "remaining" => 0,
+                 "exhausted" => true
+               }
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -328,12 +362,27 @@ defmodule SymphonyElixir.ExtensionsTest do
                "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
                "host" => nil
              },
-             "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
+             "attempts" => %{
+               "restart_count" => 0,
+               "current_retry_attempt" => 0,
+               "durable" => %{
+                 "used" => 2,
+                 "max" => 5,
+                 "remaining" => 3,
+                 "exhausted" => false
+               }
+             },
              "running" => %{
                "worker_host" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
                "turn_count" => 7,
+               "attempt_usage" => %{
+                 "used" => 2,
+                 "max" => 5,
+                 "remaining" => 3,
+                 "exhausted" => false
+               },
                "state" => "In Progress",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
@@ -669,6 +718,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
+          attempt_usage: %{used: 2, max: 5, remaining: 3, exhausted: false},
           started_at: DateTime.utc_now()
         }
       ],
@@ -693,6 +743,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           workspace_path: "/workspaces/MT-BLOCKED",
           session_id: "thread-blocked",
           blocked_at: DateTime.utc_now(),
+          attempt_usage: %{used: 5, max: 5, remaining: 0, exhausted: true},
           last_codex_event: :turn_input_required,
           last_codex_message: %{
             event: :turn_input_required,
@@ -702,6 +753,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
+      attempt_usage: %{
+        "issue-http" => %{used: 2, max: 5, remaining: 3, exhausted: false},
+        "issue-blocked" => %{used: 5, max: 5, remaining: 0, exhausted: true}
+      },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }

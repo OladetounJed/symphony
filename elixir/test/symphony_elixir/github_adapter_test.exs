@@ -17,6 +17,18 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     end
   end
 
+  defmodule FakeBoundGitHubClient do
+    def fetch_issues_by_states(states, tracker_settings) do
+      send(self(), {:github_bound_states_called, states, tracker_settings})
+      {:ok, states}
+    end
+
+    def fetch_issues_by_ids(ids, tracker_settings) do
+      send(self(), {:github_bound_ids_called, ids, tracker_settings})
+      {:ok, ids}
+    end
+  end
+
   setup do
     github_client_module = Application.get_env(:symphony_elixir, :github_client_module)
 
@@ -63,6 +75,20 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"])
     assert_receive {:github_ids_called, ["42"]}
+
+    assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"], settings)
+    assert_receive {:github_states_called, ["open"]}
+
+    assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"], settings)
+    assert_receive {:github_ids_called, ["42"]}
+
+    Application.put_env(:symphony_elixir, :github_client_module, FakeBoundGitHubClient)
+
+    assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"], settings)
+    assert_receive {:github_bound_states_called, ["open"], ^settings}
+
+    assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"], settings)
+    assert_receive {:github_bound_ids_called, ["42"], ^settings}
 
     assert [%{"name" => "github_api"}] = GitHubAdapter.agent_tool_specs()
 
@@ -394,6 +420,56 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert [%{"name" => "github_api"}] = binding.tool_specs
     assert :ok = Config.validate!()
+  end
+
+  test "attempt-ledger workflows do not advertise or execute the generic authenticated GitHub tool" do
+    {:ok, temporary_root} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    high_water_root = Path.join(temporary_root, "symphony-ledger-host-state")
+
+    File.write!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        provider:
+          repo: "octo/repo"
+          token: "test-token"
+          agent_tools_enabled: false
+          attempt_ledger:
+            enabled: false
+            repository_id: 77
+            actor_id: 0
+            app_id: 0
+            activation_label: "pilot:symphony"
+            source_revision: "#{String.duplicate("a", 40)}"
+            high_water_root: "#{high_water_root}"
+        active_states: ["open"]
+        terminal_states: ["closed"]
+      ---
+
+      You are working on {{ issue.identifier }}.
+      """
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    binding = Tracker.bind_agent_tools()
+
+    assert binding.tool_specs == []
+    assert binding.allowed_tool_names == MapSet.new()
+
+    response =
+      Tracker.execute_bound_agent_tool(
+        binding,
+        "github_api",
+        %{"method" => "DELETE", "path" => "/repos/octo/repo/issues/comments/1"},
+        github_client: fn _method, _path, _params, _body, _opts ->
+          flunk("a disabled dynamic tool must not reach the authenticated GitHub client")
+        end
+      )
+
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["supportedTools"] == []
   end
 
   defp tracker_settings(provider_overrides \\ %{}) do

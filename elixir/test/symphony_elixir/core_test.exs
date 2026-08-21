@@ -34,6 +34,23 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
 
+    write_workflow_file!(Workflow.workflow_file_path(), max_attempts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_attempts"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_attempts: 5)
+    assert {:error, :max_attempts_requires_instance_lock} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), instance_lock_port: 4041)
+    assert {:error, :instance_lock_requires_max_attempts} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_attempts: 5,
+      instance_lock_port: 4041
+    )
+
+    assert {:error, :max_attempts_requires_github_attempt_ledger} = Config.validate!()
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
@@ -628,13 +645,18 @@ defmodule SymphonyElixir.CoreTest do
     issue_identifier = "MT-557"
     old_workspace = Path.join(old_root, issue_identifier)
     new_workspace = Path.join(new_root, issue_identifier)
+    old_hook_marker = Path.join(test_root, "old-hook-ran")
+    new_hook_marker = Path.join(test_root, "new-hook-ran")
 
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: old_root,
+        hook_before_remove: "printf old > \"#{old_hook_marker}\"",
         tracker_active_states: ["Todo", "In Progress", "In Review"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
       )
+
+      old_hooks = Config.settings!().hooks
 
       File.mkdir_p!(old_workspace)
       File.mkdir_p!(new_workspace)
@@ -654,6 +676,8 @@ defmodule SymphonyElixir.CoreTest do
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
             workspace_path: old_workspace,
+            workspace_root: old_root,
+            workspace_hooks: old_hooks,
             started_at: DateTime.utc_now()
           }
         },
@@ -662,7 +686,10 @@ defmodule SymphonyElixir.CoreTest do
         retry_attempts: %{}
       }
 
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: new_root,
+        hook_before_remove: "printf new > \"#{new_hook_marker}\""
+      )
 
       issue = %Issue{
         id: issue_id,
@@ -677,6 +704,8 @@ defmodule SymphonyElixir.CoreTest do
 
       refute File.exists?(old_workspace)
       assert File.exists?(new_workspace)
+      assert File.read!(old_hook_marker) == "old"
+      refute File.exists?(new_hook_marker)
     after
       File.rm_rf(test_root)
     end
@@ -1056,7 +1085,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

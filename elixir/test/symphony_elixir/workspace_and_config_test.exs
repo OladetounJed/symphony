@@ -222,7 +222,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, canonical_recorded_root} =
                SymphonyElixir.PathSafety.canonicalize(recorded_root)
 
+      hooks = Config.settings!().hooks
+
       assert {:error, {:workspace_symlink_escape, ^recorded_workspace, ^canonical_recorded_root}, ""} =
+               Workspace.remove_recorded(recorded_workspace, nil, recorded_root, hooks)
+
+      assert {:error, {:workspace_path_unreadable, ^recorded_workspace, :workspace_root_required}, ""} =
                Workspace.remove_recorded(recorded_workspace, nil)
 
       refute File.exists?(hook_marker)
@@ -1630,7 +1635,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       case "$*" in
         *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
+          printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces' '#{workspace_path}'
+          ;;
+        *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '/remote/home/.symphony-remote-workspaces' '#{workspace_path}'
           ;;
       esac
 

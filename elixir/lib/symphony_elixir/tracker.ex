@@ -25,9 +25,14 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback reserve_attempt(Issue.t(), pos_integer(), map()) ::
+              {:ok, map()} | {:exhausted, map()} | {:error, term()}
+  @callback deactivate_attempts(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
+                      reserve_attempt: 3,
+                      deactivate_attempts: 3,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -35,9 +40,33 @@ defmodule SymphonyElixir.Tracker do
     adapter().fetch_issues_by_states(states)
   end
 
+  @spec fetch_issues_by_states([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if function_exported?(adapter, :fetch_issues_by_states, 2) do
+      adapter.fetch_issues_by_states(states, tracker_settings)
+    else
+      adapter.fetch_issues_by_states(states)
+    end
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if function_exported?(adapter, :fetch_issues_by_ids, 2) do
+      adapter.fetch_issues_by_ids(issue_ids, tracker_settings)
+    else
+      adapter.fetch_issues_by_ids(issue_ids)
+    end
   end
 
   @doc """
@@ -45,32 +74,66 @@ defmodule SymphonyElixir.Tracker do
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
-    tracker_settings = Config.settings!().tracker
+  @spec bind_agent_tools(map() | struct()) :: map()
+  def bind_agent_tools(tracker_settings \\ Config.settings!().tracker) do
     adapter = adapter_for_settings!(tracker_settings)
+    tool_specs = configured_agent_tool_specs(adapter, tracker_settings)
 
     %{
       adapter: adapter,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
+      tool_specs: tool_specs,
+      allowed_tool_names: MapSet.new(Enum.map(tool_specs, & &1["name"])),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
     }
   end
 
   @spec execute_bound_agent_tool(map(), String.t(), term(), keyword()) :: map()
   def execute_bound_agent_tool(
-        %{adapter: adapter, tracker_settings: tracker_settings},
+        %{
+          adapter: adapter,
+          tracker_settings: tracker_settings,
+          allowed_tool_names: allowed_tool_names
+        },
         tool,
         arguments,
         opts \\ []
       ) do
-    execute_agent_tool_with_adapter(
-      adapter,
-      tool,
-      arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
-    )
+    if is_binary(tool) and MapSet.member?(allowed_tool_names, tool) do
+      execute_agent_tool_with_adapter(
+        adapter,
+        tool,
+        arguments,
+        Keyword.put(opts, :tracker_settings, tracker_settings)
+      )
+    else
+      unsupported_agent_tool_response(tool)
+    end
+  end
+
+  @spec reserve_attempt(Issue.t(), pos_integer(), map()) ::
+          {:ok, map()} | {:exhausted, map()} | {:error, term()}
+  def reserve_attempt(%Issue{} = issue, max_attempts, %{tracker_settings: tracker_settings} = attempt_fuse)
+      when is_integer(max_attempts) and max_attempts > 0 and is_map(tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :reserve_attempt, 3) do
+      adapter.reserve_attempt(issue, max_attempts, attempt_fuse)
+    else
+      {:error, :attempt_ledger_unsupported}
+    end
+  end
+
+  @spec deactivate_attempts(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def deactivate_attempts(%Issue{} = issue, evidence, %{tracker_settings: tracker_settings} = attempt_fuse)
+      when is_map(evidence) and is_map(tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :deactivate_attempts, 3) do
+      adapter.deactivate_attempts(issue, evidence, attempt_fuse)
+    else
+      {:error, :attempt_deactivation_unsupported}
+    end
   end
 
   @spec validate_config(map()) :: :ok | {:error, term()}
@@ -108,6 +171,13 @@ defmodule SymphonyElixir.Tracker do
       adapter.agent_tool_specs()
     else
       []
+    end
+  end
+
+  defp configured_agent_tool_specs(adapter, tracker_settings) do
+    case tracker_settings do
+      %{provider: %{"agent_tools_enabled" => false}} -> []
+      _ -> adapter_agent_tool_specs(adapter)
     end
   end
 

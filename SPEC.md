@@ -452,6 +452,28 @@ Fields:
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
   - Invalid values fail configuration validation.
+- `max_attempts` (optional positive integer; downstream extension)
+  - Counts total top-level worker process starts for one issue, including initial dispatch,
+    continuation, failure, stall, and spawn-failure recovery.
+  - A durable provider reservation MUST be confirmed before process launch.
+  - The local pre-launch transition MUST sync file contents and the containing directory before
+    launch authorization is returned.
+  - Exhausted, unavailable, malformed, conflicting, or unconfirmed evidence MUST start no worker.
+  - The complete enabled attempt-fuse profile is immutable for the singleton runtime lifetime.
+    Reload drift MUST fail closed before dispatch and requires a full service restart.
+  - The host-state authority root MUST be securely pre-provisioned; runtime creation is forbidden.
+  - The frozen workspace/hooks, worker and agent limits, Codex authority, tracker tool, and
+    secret-scrub boundary MUST be carried into an already-reserved worker and revalidated at the
+    session boundary.
+  - Remote workspaces MUST resolve on the worker to the exact direct child of the frozen remote
+    root. Canonical containment MUST be revalidated after hooks, immediately before coding-agent
+    launch, and before recorded cleanup.
+  - Local quarantine and remote eligibility removal MUST be attempted independently. If neither
+    durable barrier can be established, polling MUST remain suspended until operator reset.
+- `instance_lock_port` (optional positive integer; downstream extension)
+  - Required with `max_attempts` by the ìwé GitHub profile.
+  - Holds a loopback socket for the agent runtime lifetime so a second service on the same host
+    fails before polling. It is not a multi-host lease.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -568,6 +590,9 @@ Dynamic reload is REQUIRED:
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
+- A configured downstream attempt fuse is an explicit exception: its complete parsed worker
+  execution profile remains frozen for that singleton lifetime. Any change fails closed until full
+  restart.
 - Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
@@ -623,6 +648,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_attempts`: optional positive integer (downstream extension)
+- `agent.instance_lock_port`: optional loopback port paired with `max_attempts` (downstream extension)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -1702,6 +1729,9 @@ After restart:
   - startup terminal workspace cleanup
   - fresh polling of active issues
   - re-dispatching eligible work
+- The downstream GitHub attempt ledger additionally recovers its remote reservation chain,
+  host-local high-water state, and durable quarantine. A quarantined issue is not eligible after
+  restart even if its activation label still exists because remote deactivation previously failed.
 
 ### 14.4 Operator Intervention Points
 

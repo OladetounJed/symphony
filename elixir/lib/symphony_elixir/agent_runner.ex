@@ -4,8 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AttemptFuse, Config, PromptBuilder, Tracker}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -20,8 +19,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    attempt_fuse = Keyword.get(opts, :attempt_fuse)
+    execution_settings = execution_settings(attempt_fuse)
+
     # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    worker_host =
+      selected_worker_host(
+        Keyword.get(opts, :worker_host),
+        execution_settings.worker.ssh_hosts
+      )
+
+    opts = Keyword.put(opts, :execution_settings, execution_settings)
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
@@ -38,18 +46,36 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    attempt_fuse = Keyword.get(opts, :attempt_fuse)
+    execution_settings = Keyword.fetch!(opts, :execution_settings)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+    with :ok <- validate_attempt_fuse(attempt_fuse),
+         {:ok, workspace} <- workspace_module().create_for_issue(issue, worker_host, attempt_fuse),
+         :ok <- validate_attempt_fuse(attempt_fuse) do
+      send_worker_runtime_info(
+        codex_update_recipient,
+        issue,
+        worker_host,
+        workspace,
+        attempt_fuse,
+        execution_settings
+      )
+
+      try do
+        with :ok <-
+               workspace_module().run_before_run_hook(
+                 workspace,
+                 issue,
+                 worker_host,
+                 attempt_fuse
+               ),
+             :ok <- validate_attempt_fuse(attempt_fuse) do
+          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
         end
-
+      after
+        workspace_module().run_after_run_hook(workspace, issue, worker_host, attempt_fuse)
+      end
+    else
       {:error, reason} ->
         {:error, reason}
     end
@@ -69,40 +95,121 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+  defp send_worker_runtime_info(
+         recipient,
+         %Issue{id: issue_id},
+         worker_host,
+         workspace,
+         attempt_fuse,
+         execution_settings
+       )
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) and
+              is_map(execution_settings) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         workspace_root: runtime_workspace_root(workspace, worker_host, attempt_fuse, execution_settings),
+         workspace_hooks: execution_settings.hooks
        }}
     )
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(
+         _recipient,
+         _issue,
+         _worker_host,
+         _workspace,
+         _attempt_fuse,
+         _execution_settings
+       ),
+       do: :ok
+
+  defp runtime_workspace_root(
+         _workspace,
+         nil,
+         %{enabled: true, workspace_root: workspace_root},
+         _execution_settings
+       ),
+       do: workspace_root
+
+  defp runtime_workspace_root(
+         _workspace,
+         worker_host,
+         %{enabled: true},
+         execution_settings
+       )
+       when is_binary(worker_host),
+       do: execution_settings.workspace.root
+
+  defp runtime_workspace_root(workspace, _worker_host, _attempt_fuse, _execution_settings),
+    do: Path.dirname(workspace)
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    execution_settings = Keyword.fetch!(opts, :execution_settings)
+    max_turns = Keyword.get(opts, :max_turns, execution_settings.agent.max_turns)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    issue_state_fetcher =
+      Keyword.get(
+        opts,
+        :issue_state_fetcher,
+        fn ids ->
+          with {:ok, issues} <- Tracker.fetch_issues_by_ids(ids, execution_settings.tracker),
+               :ok <- validate_attempt_fuse(Keyword.get(opts, :attempt_fuse)) do
+            {:ok, issues}
+          end
+        end
+      )
+
+    session_options =
+      [worker_host: worker_host]
+      |> Keyword.put(:attempt_fuse, Keyword.get(opts, :attempt_fuse))
+      |> Keyword.put(:dynamic_tool_binding, Keyword.get(opts, :dynamic_tool_binding))
+      |> Keyword.put(:execution_settings, execution_settings)
+
+    app_server = app_server_module()
+    opts = Keyword.put(opts, :app_server_module, app_server)
+
+    with {:ok, session} <- app_server.start_session(workspace, session_options) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
-        AppServer.stop_session(session)
+        app_server.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp validate_attempt_fuse(nil), do: :ok
+  defp validate_attempt_fuse(attempt_fuse) when is_map(attempt_fuse), do: AttemptFuse.validate_current(attempt_fuse)
+
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    app_server = Keyword.fetch!(opts, :app_server_module)
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           app_server.run_turn(
              app_session,
              prompt,
              issue,
@@ -110,7 +217,16 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
+      continuation =
+        with :ok <- validate_attempt_fuse(Keyword.get(opts, :attempt_fuse)) do
+          continue_with_issue?(
+            issue,
+            issue_state_fetcher,
+            Keyword.fetch!(opts, :execution_settings)
+          )
+        end
+
+      case continuation do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
@@ -153,10 +269,15 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(issue, issue_state_fetcher),
+    do: continue_with_issue?(issue, issue_state_fetcher, Config.settings!())
+
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, settings)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+        if active_issue_state?(refreshed_issue.state, settings) and
+             issue_routable?(refreshed_issue, settings) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -170,19 +291,30 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _settings), do: {:done, issue}
 
-  defp active_issue_state?(state_name) when is_binary(state_name) do
+  defp active_issue_state?(state_name, settings) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
 
-    Config.settings!().tracker.active_states
+    settings.tracker.active_states
     |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
   end
 
-  defp active_issue_state?(_state_name), do: false
+  defp active_issue_state?(_state_name, _settings), do: false
 
-  defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+  defp issue_routable?(%Issue{} = issue, settings) do
+    Issue.routable?(issue, settings.tracker.required_labels)
+  end
+
+  defp execution_settings(%{enabled: true, execution_settings: settings}), do: settings
+  defp execution_settings(_attempt_fuse), do: Config.settings!()
+
+  defp workspace_module do
+    Application.get_env(:symphony_elixir, :workspace_module, SymphonyElixir.Workspace)
+  end
+
+  defp app_server_module do
+    Application.get_env(:symphony_elixir, :codex_app_server_module, SymphonyElixir.Codex.AppServer)
   end
 
   defp selected_worker_host(nil, []), do: nil

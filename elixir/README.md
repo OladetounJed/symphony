@@ -35,6 +35,10 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+The ìwé downstream attempt-fuse is stricter: ledger/exhaustion blocks also write a host-local
+quarantine before remote deactivation. That quarantine survives runtime restart and is never
+cleared automatically.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -165,6 +169,25 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- The ìwé downstream fork optionally supports `agent.max_attempts`. When configured for the GitHub
+  adapter, it counts every top-level worker process start, including initial dispatch, continuation,
+  failure, stall, and spawn-failure recovery. It requires `agent.instance_lock_port` and a configured
+  `tracker.provider.attempt_ledger`; missing or invalid durable evidence fails closed.
+- `agent.instance_lock_port` is a host-local singleton fence, not multi-host coordination. The
+  downstream pilot supports one service instance on one host only. It owns a frozen copy of the
+  complete fuse profile outside the inner task/orchestrator restart domain; any fuse-setting reload
+  drift denies dispatch until a full reviewed service restart.
+- The host-state root must be pre-provisioned as a dedicated mode-0700 directory, is canonicalized,
+  and must be disjoint from the workflow-relative canonical workspace root. Missing, symlinked, or
+  insecure roots fail closed without creation or permission repair. Local state is file-synced,
+  atomically renamed, and directory-synced before launch authorization.
+- Local quarantine and remote label removal are independent barriers. Failure to establish either
+  trips the outer singleton and suspends polling until an explicit operator reset and full restart.
+- The complete frozen workspace/hook, worker/agent, Codex authority, no-tools, and tracker-secret
+  profile is passed through worker startup and revalidated after hooks, preventing reload drift
+  from granting an already-reserved session new authority.
+- Reservation five may run. Its exit triggers durable quarantine, one exhaustion evidence record,
+  activation-label removal, and confirmation without a sixth reservation.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -255,6 +278,16 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+- Downstream attempt-ledger workflows set `tracker.provider.agent_tools_enabled: false`. This removes
+  `github_api` from the App Server session and rejects execution even if an unadvertised call is
+  attempted. The host-only ledger still uses the tracker client through exact issue-comment and
+  activation-label operations.
+- The downstream `tracker.provider.attempt_ledger` object contains `enabled`, immutable
+  `repository_id`, immutable bot `actor_id`, immutable GitHub `app_id`, `activation_label`, the exact
+  40-character downstream `source_revision`, and an absolute or `$ENV` `high_water_root` outside all
+  issue workspaces. Enabled ledgers require positive actor/App IDs; disabled pilot configuration
+  remains non-runnable and may use zero sentinels until a reviewed activation change supplies the
+  real identities.
 
 ### Jira Cloud adapter
 

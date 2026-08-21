@@ -100,11 +100,19 @@ defmodule SymphonyElixir.AppServerTest do
           3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-timeout"}}}' ;;
           4)
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-timeout"}}}'
-            sleep 0.15
+            sleep 0.1
             printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"one"}}}'
-            sleep 0.15
+            sleep 0.1
             printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
-            sleep 0.15
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"three"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"four"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"five"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"six"}}}'
+            sleep 0.1
             printf '%s\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -118,7 +126,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_turn_timeout_ms: 250
+        codex_turn_timeout_ms: 500
       )
 
       issue = %Issue{
@@ -144,7 +152,7 @@ defmodule SymphonyElixir.AppServerTest do
           3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-silent"}}}' ;;
           4)
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-silent"}}}'
-            sleep 0.4
+            sleep 0.8
             printf '%s\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1496,6 +1504,126 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server rejects a canonical remote workspace escape before launch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-remote-escape-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+    end)
+
+    try do
+      trace_file = Path.join(test_root, "ssh.trace")
+      fake_ssh = Path.join(test_root, "ssh")
+      remote_workspace = "/remote/workspaces/MT-REMOTE-ESCAPE"
+
+      File.mkdir_p!(test_root)
+      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+      printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '/remote/workspaces' '/home/worker'
+      exit 0
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: "/remote/workspaces",
+        codex_command: "fake-remote-codex app-server"
+      )
+
+      assert {:error, {:invalid_workspace_cwd, :remote_validation, reason}} =
+               AppServer.start_session(remote_workspace, worker_host: "worker-01")
+
+      assert reason ==
+               {:remote_workspace_validation_failed, :outside_root, "/remote/workspaces", "/home/worker"}
+
+      refute File.read!(trace_file) =~ "exec fake-remote-codex"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote launch rechecks containment in the same shell before Codex exec" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-remote-launch-retarget-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_marker = System.get_env("SYMP_TEST_CODEX_MARKER")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_CODEX_MARKER", previous_marker)
+    end)
+
+    try do
+      remote_root = Path.join(test_root, "remote-workspaces")
+      remote_workspace = Path.join(remote_root, "MT-REMOTE-RETARGET")
+      outside = Path.join(test_root, "outside")
+      marker = Path.join(test_root, "codex-started")
+      fake_ssh = Path.join(test_root, "ssh")
+      fake_codex = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(remote_workspace)
+      File.mkdir_p!(outside)
+      System.put_env("SYMP_TEST_CODEX_MARKER", marker)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_codex, """
+      #!/bin/sh
+      : > "$SYMP_TEST_CODEX_MARKER"
+      exit 1
+      """)
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      last=''
+      for argument in "$@"; do last="$argument"; done
+      case "$last" in
+        *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+          eval "$last"
+          status=$?
+          rm -rf '#{remote_workspace}'
+          ln -s '#{outside}' '#{remote_workspace}'
+          exit "$status"
+          ;;
+        *)
+          eval "$last"
+          ;;
+      esac
+      """)
+
+      File.chmod!(fake_codex, 0o755)
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: remote_root,
+        codex_command: "#{fake_codex} app-server"
+      )
+
+      assert {:error, _reason} =
+               AppServer.start_session(remote_workspace, worker_host: "worker-01")
+
+      refute File.exists?(marker)
+      assert {:ok, %File.Stat{type: :symlink}} = File.lstat(remote_workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(
@@ -1525,6 +1653,13 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      case "$*" in
+        *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '/remote/workspaces' '#{remote_workspace}'
+          exit 0
+          ;;
+      esac
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1579,13 +1714,12 @@ defmodule SymphonyElixir.AppServerTest do
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
-      assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
-      assert argv_line =~ "cd "
-      assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
-      assert argv_line =~ "exec "
-      assert argv_line =~ "fake-remote-codex app-server"
+      assert trace =~ "ARGV:-T -p 2200 worker-01 bash -lc"
+      assert trace =~ "cd "
+      assert trace =~ remote_workspace
+      assert trace =~ "unset LINEAR_API_KEY"
+      assert trace =~ "exec "
+      assert trace =~ "fake-remote-codex app-server"
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
