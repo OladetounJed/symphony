@@ -149,46 +149,93 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   end
 
   defp deactivate_with(issue, evidence, tracker_settings, request_fun, opts) do
-    with {:ok, max_attempts} <- evidence_max(evidence),
-         {:ok, settings} <- runtime_settings(tracker_settings, Keyword.put(opts, :allow_disabled, true)),
-         {:ok, context} <-
-           issue_context(issue, settings, max_attempts, tracker_settings) do
-      quarantine_result = write_quarantine(context, evidence)
+    result =
+      with {:ok, max_attempts} <- evidence_max(evidence),
+           {:ok, settings} <-
+             base_runtime_settings(tracker_settings, Keyword.put(opts, :allow_disabled, true)),
+           {:ok, remote_context} <-
+             issue_context(issue, %{settings | high_water_root: nil}, max_attempts, tracker_settings) do
+        quarantine_result =
+          with {:ok, local_settings} <- prepare_runtime_root(settings, opts),
+               {:ok, local_context} <-
+                 issue_context(issue, local_settings, max_attempts, tracker_settings) do
+            write_quarantine(local_context, evidence)
+          end
 
-      exhaustion_result =
-        ensure_exhaustion_evidence(context, evidence, tracker_settings, request_fun)
+        exhaustion_result =
+          ensure_exhaustion_evidence(
+            remote_context,
+            evidence,
+            tracker_settings,
+            request_fun
+          )
 
-      delete_result = remove_activation_label(context, tracker_settings, request_fun)
-      confirmation_result = confirm_activation_label_absent(context, tracker_settings, request_fun)
+        delete_result = remove_activation_label(remote_context, tracker_settings, request_fun)
 
-      case {quarantine_result, exhaustion_result, confirmation_result} do
-        {:ok, {:ok, exhaustion}, :ok} ->
-          {:ok,
-           %{
-             activation_label: context.activation_label,
-             evidence_url: exhaustion[:evidence_url],
-             deactivated: true
-           }}
+        confirmation_result =
+          confirm_activation_label_absent(remote_context, tracker_settings, request_fun)
 
-        {{:error, quarantine_reason}, {:ok, exhaustion}, :ok} ->
-          {:error, {:deactivated_without_quarantine, quarantine_reason, exhaustion[:evidence_url]}}
-
-        {:ok, {:error, evidence_reason}, :ok} ->
-          {:error, {:deactivated_without_exhaustion_evidence, evidence_reason}}
-
-        {{:error, quarantine_reason}, {:error, evidence_reason}, :ok} ->
-          {:error, {:deactivated_without_local_or_exhaustion_evidence, quarantine_reason, evidence_reason}}
-
-        {{:error, quarantine_reason}, evidence_result, {:error, confirmation_reason}} ->
-          unfenced =
-            {:attempt_deactivation_unfenced, quarantine_reason, delete_result, confirmation_reason, evidence_result}
-
-          {:error, unfenced}
-
-        {:ok, evidence_result, {:error, confirmation_reason}} ->
-          {:error, {:attempt_deactivation_failed, delete_result, confirmation_reason, evidence_result}}
+        {:classified,
+         classify_deactivation(
+           remote_context,
+           quarantine_result,
+           exhaustion_result,
+           delete_result,
+           confirmation_result
+         )}
       end
+
+    case result do
+      {:classified, classified_result} -> classified_result
+      {:error, reason} -> unfenced_preparation_error(reason)
     end
+  end
+
+  defp classify_deactivation(
+         context,
+         quarantine_result,
+         exhaustion_result,
+         delete_result,
+         confirmation_result
+       ) do
+    case {quarantine_result, exhaustion_result, confirmation_result} do
+      {:ok, {:ok, exhaustion}, :ok} ->
+        {:ok,
+         %{
+           activation_label: context.activation_label,
+           evidence_url: exhaustion[:evidence_url],
+           deactivated: true
+         }}
+
+      {{:error, quarantine_reason}, {:ok, exhaustion}, :ok} ->
+        {:error, {:deactivated_without_quarantine, quarantine_reason, exhaustion[:evidence_url]}}
+
+      {:ok, {:error, evidence_reason}, :ok} ->
+        {:error, {:deactivated_without_exhaustion_evidence, evidence_reason}}
+
+      {{:error, quarantine_reason}, {:error, evidence_reason}, :ok} ->
+        {:error, {:deactivated_without_local_or_exhaustion_evidence, quarantine_reason, evidence_reason}}
+
+      {{:error, quarantine_reason}, evidence_result, {:error, confirmation_reason}} ->
+        unfenced =
+          {:attempt_deactivation_unfenced, quarantine_reason, delete_result, confirmation_reason, evidence_result}
+
+        {:error, unfenced}
+
+      {:ok, evidence_result, {:error, confirmation_reason}} ->
+        {:error, {:attempt_deactivation_failed, delete_result, confirmation_reason, evidence_result}}
+    end
+  end
+
+  defp unfenced_preparation_error(reason) do
+    delete_result = :remote_delete_not_attempted
+    confirmation_result = :remote_confirmation_not_attempted
+    evidence_result = {:error, :remote_evidence_not_attempted}
+
+    unfenced =
+      {:attempt_deactivation_unfenced, reason, delete_result, confirmation_result, evidence_result}
+
+    {:error, unfenced}
   end
 
   defp begin_reservation(context, ledger, local_state, tracker_settings, request_fun) do
@@ -1174,6 +1221,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   end
 
   defp runtime_settings(tracker_settings, opts) do
+    with {:ok, settings} <- base_runtime_settings(tracker_settings, opts) do
+      prepare_runtime_root(settings, opts)
+    end
+  end
+
+  defp base_runtime_settings(tracker_settings, opts) do
     provider = provider_settings(tracker_settings)
 
     with :ok <- validate_agent_tool_setting(provider),
@@ -1182,14 +1235,19 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
          {:ok, settings} <- normalize_ledger_settings(raw_settings, true),
          true <-
            settings.enabled or Keyword.get(opts, :allow_disabled, false) or
-             {:error, :github_attempt_ledger_disabled},
-         {:ok, high_water_root} <- resolve_high_water_root(settings.high_water_root, opts),
-         {:ok, secure_root} <-
-           prepare_high_water_root(high_water_root, Keyword.get(opts, :workspace_root)) do
-      {:ok, Map.put(settings, :high_water_root, secure_root)}
+             {:error, :github_attempt_ledger_disabled} do
+      {:ok, settings}
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_github_attempt_ledger}
+    end
+  end
+
+  defp prepare_runtime_root(settings, opts) do
+    with {:ok, high_water_root} <- resolve_high_water_root(settings.high_water_root, opts),
+         {:ok, secure_root} <-
+           prepare_high_water_root(high_water_root, Keyword.get(opts, :workspace_root)) do
+      {:ok, Map.put(settings, :high_water_root, secure_root)}
     end
   end
 
@@ -1297,14 +1355,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
   defp prepare_high_water_root(root, workspace_root) do
     with :ok <- reject_symlink_components(root),
-         {:ok, root_preexisted?} <- root_preexisting_directory?(root),
+         :ok <- require_preprovisioned_root(root),
          {:ok, canonical_root} <- PathSafety.canonicalize(root),
          {:ok, canonical_workspace} <- canonical_workspace(workspace_root),
          :ok <- validate_root_separation(canonical_root, canonical_workspace),
-         :ok <- File.mkdir_p(canonical_root),
          :ok <- reject_symlink_components(root),
          :ok <- confirm_canonical_root(root, canonical_root),
-         :ok <- secure_root_permissions(canonical_root, root_preexisted?),
          :ok <- validate_secure_directory(canonical_root) do
       {:ok, canonical_root}
     else
@@ -1316,17 +1372,14 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     end
   end
 
-  defp root_preexisting_directory?(path) do
+  defp require_preprovisioned_root(path) do
     case File.lstat(path) do
-      {:ok, %File.Stat{type: :directory}} -> {:ok, true}
+      {:ok, %File.Stat{type: :directory}} -> :ok
       {:ok, _stat} -> {:error, :github_attempt_high_water_root_insecure}
-      {:error, :enoent} -> {:ok, false}
+      {:error, :enoent} -> {:error, :github_attempt_high_water_root_not_provisioned}
       {:error, reason} -> {:error, {:github_attempt_high_water_root_lstat, reason}}
     end
   end
-
-  defp secure_root_permissions(path, true), do: validate_secure_directory(path)
-  defp secure_root_permissions(path, false), do: File.chmod(path, 0o700)
 
   defp confirm_canonical_root(root, expected) do
     case PathSafety.canonicalize(root) do
@@ -1401,17 +1454,8 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
          {:ok, issue_id} <- positive_integer(native_ref["id"]),
          true <- present_string?(native_ref["node_id"]) or {:error, :github_attempt_issue_node_id},
          true <- Integer.to_string(issue_number) == issue.id or {:error, :github_attempt_issue_number_mismatch} do
-      high_water_path =
-        Path.join(
-          settings.high_water_root,
-          "#{settings.repository_id}-#{issue_id}.json"
-        )
-
-      quarantine_path =
-        Path.join(
-          settings.high_water_root,
-          "#{settings.repository_id}-#{issue_id}.quarantine.json"
-        )
+      high_water_path = local_state_path(settings, issue_id, ".json")
+      quarantine_path = local_state_path(settings, issue_id, ".quarantine.json")
 
       {:ok,
        %{
@@ -1431,6 +1475,13 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
        }}
     end
   end
+
+  defp local_state_path(%{high_water_root: root, repository_id: repository_id}, issue_id, suffix)
+       when is_binary(root) do
+    Path.join(root, "#{repository_id}-#{issue_id}#{suffix}")
+  end
+
+  defp local_state_path(_settings, _issue_id, _suffix), do: nil
 
   defp evidence_max(evidence) do
     value = evidence_value(evidence, :max, "max", nil)

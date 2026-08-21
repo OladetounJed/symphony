@@ -2,9 +2,9 @@ defmodule SymphonyElixir.AttemptFuse do
   @moduledoc """
   Freezes and validates the configuration that defines one attempt budget.
 
-  An enabled fuse is immutable for the lifetime of its host-local instance
-  lock. Workflow reloads may change unrelated runtime settings, but any fuse
-  drift is rejected before dispatch.
+  The complete worker execution profile is immutable for the lifetime of an
+  enabled fuse so repository hooks cannot expand executor authority by
+  rewriting the workflow after a durable reservation.
   """
 
   alias SymphonyElixir.{Config, Workflow}
@@ -15,7 +15,8 @@ defmodule SymphonyElixir.AttemptFuse do
           max_attempts: pos_integer() | nil,
           instance_lock_port: pos_integer() | nil,
           tracker_settings: map() | struct(),
-          workspace_root: String.t()
+          workspace_root: String.t(),
+          execution_settings: Schema.t()
         }
 
   @spec snapshot(Schema.t()) :: snapshot()
@@ -30,7 +31,8 @@ defmodule SymphonyElixir.AttemptFuse do
       max_attempts: settings.agent.max_attempts,
       instance_lock_port: settings.agent.instance_lock_port,
       tracker_settings: settings.tracker,
-      workspace_root: Path.expand(settings.workspace.root, workflow_directory)
+      workspace_root: Path.expand(settings.workspace.root, workflow_directory),
+      execution_settings: settings
     }
   end
 

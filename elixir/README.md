@@ -177,15 +177,15 @@ Notes:
   downstream pilot supports one service instance on one host only. It owns a frozen copy of the
   complete fuse profile outside the inner task/orchestrator restart domain; any fuse-setting reload
   drift denies dispatch until a full reviewed service restart.
-- The host-state root is canonicalized, restricted to owner access, and must be disjoint from the
-  workflow-relative canonical workspace root. Symlinked host-state components or files and
-  insecure pre-existing directories fail closed without changing their permissions. Local state is
-  file-synced, atomically renamed, and directory-synced before launch authorization.
+- The host-state root must be pre-provisioned as a dedicated mode-0700 directory, is canonicalized,
+  and must be disjoint from the workflow-relative canonical workspace root. Missing, symlinked, or
+  insecure roots fail closed without creation or permission repair. Local state is file-synced,
+  atomically renamed, and directory-synced before launch authorization.
 - Local quarantine and remote label removal are independent barriers. Failure to establish either
   trips the outer singleton and suspends polling until an explicit operator reset and full restart.
-- The frozen no-tools binding and tracker-secret scrub set are passed through worker startup and
-  revalidated after hooks, preventing reload drift from granting an already-reserved session new
-  tracker authority.
+- The complete frozen workspace/hook, worker/agent, Codex authority, no-tools, and tracker-secret
+  profile is passed through worker startup and revalidated after hooks, preventing reload drift
+  from granting an already-reserved session new authority.
 - Reservation five may run. Its exit triggers durable quarantine, one exhaustion evidence record,
   activation-label removal, and confirmation without a sixth reservation.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue

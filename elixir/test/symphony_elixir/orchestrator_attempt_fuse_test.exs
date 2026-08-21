@@ -348,6 +348,42 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
 
     assert is_pid(restarted_orchestrator)
     assert :sys.get_state(orchestrator_name).dispatch_suspended
+
+    retry_token = make_ref()
+
+    timer_ref =
+      Process.send_after(
+        orchestrator_name,
+        {:retry_issue, issue.id, retry_token},
+        60_000
+      )
+
+    :sys.replace_state(orchestrator_name, fn state ->
+      retry = %{
+        attempt: 2,
+        timer_ref: timer_ref,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond) + 60_000,
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "stale retry after global trip",
+        worker_host: nil,
+        workspace_path: nil,
+        attempt_usage: nil
+      }
+
+      %{state | retry_attempts: %{issue.id => retry}}
+    end)
+
+    send(orchestrator_name, {:retry_issue, issue.id, retry_token})
+
+    assert eventually_value(fn ->
+             state = :sys.get_state(orchestrator_name)
+             if state.retry_attempts == %{}, do: :cleared
+           end) == :cleared
+
+    assert Process.read_timer(timer_ref) == false
+    refute Orchestrator.should_dispatch_issue_for_test(issue, :sys.get_state(orchestrator_name))
     refute_receive {:attempt_reserve_called, _, _}, 100
   end
 
@@ -676,6 +712,9 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
   defp write_github_attempt_workflow!(path, root, lock_port, opts \\ []) do
     source_revision = Keyword.get(opts, :source_revision, String.duplicate("a", 40))
     stall_timeout_ms = Keyword.get(opts, :stall_timeout_ms, 300_000)
+    high_water_root = Path.join(root, "host-state")
+    File.mkdir_p!(high_water_root)
+    File.chmod!(high_water_root, 0o700)
 
     File.write!(
       path,
@@ -694,7 +733,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
             app_id: 99
             activation_label: "pilot:symphony"
             source_revision: "#{source_revision}"
-            high_water_root: "#{Path.join(root, "host-state")}"
+            high_water_root: "#{high_water_root}"
         required_labels: ["agent-ready", "pilot:symphony"]
         active_states: ["open"]
         terminal_states: ["closed"]

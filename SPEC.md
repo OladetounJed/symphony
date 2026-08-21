@@ -461,8 +461,10 @@ Fields:
   - Exhausted, unavailable, malformed, conflicting, or unconfirmed evidence MUST start no worker.
   - The complete enabled attempt-fuse profile is immutable for the singleton runtime lifetime.
     Reload drift MUST fail closed before dispatch and requires a full service restart.
-  - The frozen tracker tool and secret-scrub boundary MUST be carried into an already-reserved
-    worker and revalidated at the session boundary.
+  - The host-state authority root MUST be securely pre-provisioned; runtime creation is forbidden.
+  - The frozen workspace/hooks, worker and agent limits, Codex authority, tracker tool, and
+    secret-scrub boundary MUST be carried into an already-reserved worker and revalidated at the
+    session boundary.
   - Local quarantine and remote eligibility removal MUST be attempted independently. If neither
     durable barrier can be established, polling MUST remain suspended until operator reset.
 - `instance_lock_port` (optional positive integer; downstream extension)
@@ -585,9 +587,9 @@ Dynamic reload is REQUIRED:
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
-- A configured downstream attempt fuse is an explicit exception: its budget, singleton port,
-  tracker/repository identity, source revision, host-state root, workspace root, and agent-tool
-  boundary remain frozen for that singleton lifetime. Any change fails closed until full restart.
+- A configured downstream attempt fuse is an explicit exception: its complete parsed worker
+  execution profile remains frozen for that singleton lifetime. Any change fails closed until full
+  restart.
 - Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY

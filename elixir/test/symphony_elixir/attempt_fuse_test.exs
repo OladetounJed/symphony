@@ -24,6 +24,22 @@ defmodule SymphonyElixir.AttemptFuseTest do
       %{frozen | max_attempts: 6},
       %{frozen | instance_lock_port: port + 1},
       %{frozen | workspace_root: frozen.workspace_root <> "-changed"},
+      put_in(frozen, [:execution_settings, Access.key(:agent), Access.key(:max_turns)], 240),
+      put_in(
+        frozen,
+        [:execution_settings, Access.key(:agent), Access.key(:max_concurrent_agents)],
+        6
+      ),
+      put_in(
+        frozen,
+        [:execution_settings, Access.key(:codex), Access.key(:thread_sandbox)],
+        "danger-full-access"
+      ),
+      put_in(
+        frozen,
+        [:execution_settings, Access.key(:codex), Access.key(:approval_policy)],
+        "never"
+      ),
       put_in(frozen, [:tracker_settings, Access.key(:provider), "repo"], "octo/other"),
       put_in(frozen, [:tracker_settings, Access.key(:provider), "token"], "other-token"),
       put_in(frozen, [:tracker_settings, Access.key(:provider), "agent_tools_enabled"], true),
@@ -81,6 +97,18 @@ defmodule SymphonyElixir.AttemptFuseTest do
 
     assert {:error, :attempt_fuse_config_drift} = AttemptFuse.validate_current(disabled)
     File.rm_rf(root)
+  end
+
+  test "a disabled fuse binds worker tools from the current reloaded tracker" do
+    disabled = AttemptFuse.current_snapshot()
+    refute disabled.enabled
+
+    assert Orchestrator.worker_tool_binding_for_test(disabled).tool_specs != []
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    assert :ok = WorkflowStore.force_reload()
+
+    assert Orchestrator.worker_tool_binding_for_test(disabled).tool_specs == []
   end
 
   test "relative workspace roots are frozen against the selected workflow directory" do
@@ -186,6 +214,12 @@ defmodule SymphonyElixir.AttemptFuseTest do
         instance_lock_port: #{port}
       codex:
         command: "codex app-server"
+        approval_policy:
+          reject:
+            sandbox_approval: true
+            rules: true
+            mcp_elicitations: true
+        thread_sandbox: "workspace-write"
       ---
 
       Immutable fuse profile test.

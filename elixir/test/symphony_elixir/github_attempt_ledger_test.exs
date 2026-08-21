@@ -30,6 +30,8 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     workspace_root = Path.join(root, "workspace")
     high_water_root = Path.join(root, "host-state")
     File.mkdir_p!(workspace_root)
+    File.mkdir_p!(high_water_root)
+    File.chmod!(high_water_root, 0o700)
 
     state =
       start_supervised!({Agent, &initial_remote_state/0})
@@ -359,6 +361,16 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert Agent.get(context.state, & &1.comments) == []
   end
 
+  test "the host-state root must be securely pre-provisioned", context do
+    File.rmdir!(context.high_water_root)
+
+    assert {:error, :github_attempt_high_water_root_not_provisioned} =
+             reserve(context, request_fun(context.state))
+
+    refute File.exists?(context.high_water_root)
+    assert Agent.get(context.state, & &1.comments) == []
+  end
+
   test "a parent-directory sync failure cannot authorize a worker start", context do
     Application.put_env(
       :symphony_elixir,
@@ -384,6 +396,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   test "a symlinked host-state root resolving inside the workspace is rejected", context do
     target = Path.join(context.workspace_root, "agent-controlled-state")
     File.mkdir_p!(target)
+    File.rmdir!(context.high_water_root)
     File.ln_s!(target, context.high_water_root)
 
     assert {:error, :github_attempt_high_water_symlink} =
@@ -395,6 +408,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   test "a symlinked host-state root is rejected even when its target is otherwise safe", context do
     target = Path.join(context.root, "safe-host-state-target")
     File.mkdir_p!(target)
+    File.rmdir!(context.high_water_root)
     File.ln_s!(target, context.high_water_root)
 
     assert {:error, :github_attempt_high_water_symlink} =
@@ -404,7 +418,6 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   end
 
   test "an insecure existing host-state directory is rejected without changing its mode", context do
-    File.mkdir_p!(context.high_water_root)
     File.chmod!(context.high_water_root, 0o755)
 
     assert {:error, :github_attempt_high_water_root_insecure} =
@@ -466,6 +479,8 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert {:ok, %{used: 1}} = reserve(context, request_fun(context.state))
 
     other_root = Path.join(context.root, "page-limit-state")
+    File.mkdir_p!(other_root)
+    File.chmod!(other_root, 0o700)
     settings = tracker_settings(other_root)
 
     Agent.update(context.state, fn state ->
@@ -550,6 +565,38 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     remote = Agent.get(context.state, & &1)
     refute "pilot:symphony" in remote.labels
     assert Enum.count(remote.comments, &String.starts_with?(&1["body"], exhaustion_marker())) == 1
+  end
+
+  test "a missing pre-provisioned root cannot suppress remote deactivation", context do
+    File.rmdir!(context.high_water_root)
+
+    assert {:error, {:deactivated_without_quarantine, :github_attempt_high_water_root_not_provisioned, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "root_not_provisioned"},
+               context.tracker_settings,
+               request_fun(context.state),
+               workspace_root: context.workspace_root
+             )
+
+    refute File.exists?(context.high_water_root)
+    refute "pilot:symphony" in Agent.get(context.state, & &1.labels)
+  end
+
+  test "missing local root plus unavailable remote fencing is explicitly unfenced", context do
+    File.rmdir!(context.high_water_root)
+    Agent.update(context.state, &%{&1 | delete_mode: :error})
+
+    assert {:error, {:attempt_deactivation_unfenced, :github_attempt_high_water_root_not_provisioned, _, _, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "root_and_remote_failed"},
+               context.tracker_settings,
+               request_fun(context.state),
+               workspace_root: context.workspace_root
+             )
+
+    assert "pilot:symphony" in Agent.get(context.state, & &1.labels)
   end
 
   test "local and remote deactivation failure is reported as unfenced", context do

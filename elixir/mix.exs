@@ -66,7 +66,14 @@ defmodule SymphonyElixir.MixProject do
     ]
 
     if attempt_fuse_coverage?() do
-      modules
+      modules --
+        [
+          SymphonyElixir.Orchestrator,
+          SymphonyElixir.Orchestrator.State,
+          SymphonyElixir.AgentRunner,
+          SymphonyElixir.Codex.AppServer,
+          SymphonyElixir.Codex.DynamicTool
+        ]
     else
       [SymphonyElixir.GitHub.AttemptLedger | modules]
     end

@@ -18,11 +18,12 @@ GitHub Issues adapter:
 - A configured GitHub bot/App identity writes one canonical issue comment
   reservation before `Task.Supervisor.start_child/2` may run. The reservation
   is re-read and confirmed before launch.
-- A canonical, mode-restricted host-state root outside all issue workspaces
-  stores high-water and quarantine records. The root is resolved against the
-  selected workflow, pre-existing insecure directories are rejected without
-  mode mutation, and original-path symlink components/files or any canonical
-  overlap with the workspace root fail closed. High-water state can only veto
+- A pre-provisioned, dedicated mode-0700 host-state root outside all issue
+  workspaces stores high-water and quarantine records. Symphony never creates
+  or repairs this authority root. The root is resolved against the selected
+  workflow, insecure directories are rejected without mode mutation, and
+  original-path symlink components/files or any canonical overlap with the
+  workspace root fail closed. High-water state can only veto
   a regressed GitHub history; it never authorizes a start by itself.
 - Every pre-launch local-state transition syncs file contents, atomically
   renames, and syncs the parent directory before worker authorization. A sync
@@ -36,10 +37,12 @@ GitHub Issues adapter:
   and full service restart.
 - The fifth reservation still starts worker five. When that worker exits, the
   orchestrator deactivates the issue without attempting a sixth reservation.
-- The complete enabled fuse profile (budget, lock, tracker identity, repository,
-  source revision, host-state root, workspace root, and tool boundary) is
-  immutable for the singleton lifetime. Any workflow reload drift blocks before
-  dispatch and requires a full reviewed service restart.
+- The complete enabled worker execution profile (budget, lock, tracker identity,
+  repository, source revision, host-state root, workspace root/hooks, worker
+  hosts, agent limits, Codex command, approvals, sandbox, timeouts, and tool
+  boundary) is immutable for the singleton lifetime and is passed into the
+  worker. Any workflow reload drift blocks before dispatch and requires a full
+  reviewed service restart.
 - GitHub's generic authenticated `github_api` dynamic tool is disabled for the
   ìwé workflow and unadvertised tool calls are rejected, so Codex and helper
   agents cannot use the tracker identity to forge or delete ledger evidence.
@@ -58,10 +61,10 @@ state fails closed. A full host-state loss combined with authorized deletion of
 the entire remote tail remains an administrative trust violation, not a
 supported recovery path.
 
-The normal suite retains upstream's 100% included-module threshold. The ledger
-I/O boundary also has a separate failure-sensitive line-coverage gate (currently
-88% minimum) plus supervised no-network rehearsal coverage. This avoids claiming
-that an excluded I/O-heavy safety module is covered by the upstream aggregate.
+The normal suite retains upstream's 100% included-module threshold. The focused
+fuse profile re-includes the ledger, orchestrator, AgentRunner, AppServer, and
+dynamic-tool boundary with documented per-module line-coverage floors plus
+supervised no-network rehearsal coverage.
 
 The checked-in ìwé workflow keeps the ledger disabled until the real bot and
 App IDs are provisioned in the separately reviewed live-pilot task. Disabled,

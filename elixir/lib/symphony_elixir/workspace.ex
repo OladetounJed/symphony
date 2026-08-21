@@ -12,21 +12,43 @@ defmodule SymphonyElixir.Workspace do
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, worker_host \\ nil),
+    do: create_for_issue(issue_or_identifier, worker_host, nil)
+
+  @doc false
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), map() | nil) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host, attempt_fuse) do
     issue_context = issue_context(issue_or_identifier)
+    settings = execution_settings(attempt_fuse)
+    workspace_root = execution_workspace_root(attempt_fuse, settings, worker_host)
 
     try do
       safe_id = workspace_key(issue_or_identifier)
 
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+      with {:ok, workspace} <-
+             workspace_path_for_issue(safe_id, worker_host, workspace_root),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           {:ok, workspace, created?} <-
+             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms) do
+        case maybe_run_after_create_hook(
+               workspace,
+               issue_context,
+               created?,
+               worker_host,
+               settings.hooks
+             ) do
           :ok ->
             {:ok, workspace}
 
           {:error, _reason} = error ->
-            cleanup_failed_new_workspace(workspace, created?, worker_host)
+            cleanup_failed_new_workspace(
+              workspace,
+              created?,
+              worker_host,
+              settings.hooks.timeout_ms
+            )
+
             error
         end
       end
@@ -37,7 +59,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  defp ensure_workspace(workspace, nil, _timeout_ms) do
     cond do
       File.dir?(workspace) ->
         {:ok, workspace, false}
@@ -51,7 +73,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, timeout_ms) when is_binary(worker_host) do
     script =
       [
         "set -eu",
@@ -72,7 +94,7 @@ defmodule SymphonyElixir.Workspace do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, {output, 0}} ->
         parse_remote_workspace_output(output)
 
@@ -218,42 +240,73 @@ defmodule SymphonyElixir.Workspace do
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
-  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil),
+    do: run_before_run_hook(workspace, issue_or_identifier, worker_host, nil)
+
+  @doc false
+  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(), map() | nil) ::
+          :ok | {:error, term()}
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host, attempt_fuse)
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    hooks = execution_settings(attempt_fuse).hooks
 
     case hooks.before_run do
       nil ->
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "before_run", worker_host)
+        run_hook(
+          command,
+          workspace,
+          issue_context,
+          "before_run",
+          worker_host,
+          hooks.timeout_ms
+        )
     end
   end
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
-  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil),
+    do: run_after_run_hook(workspace, issue_or_identifier, worker_host, nil)
+
+  @doc false
+  @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), map() | nil) :: :ok
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host, attempt_fuse)
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    hooks = execution_settings(attempt_fuse).hooks
 
     case hooks.after_run do
       nil ->
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "after_run", worker_host)
+        run_hook(
+          command,
+          workspace,
+          issue_context,
+          "after_run",
+          worker_host,
+          hooks.timeout_ms
+        )
         |> ignore_hook_failure()
     end
   end
 
-  defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
-    Config.local_workspace_root()
+  defp workspace_path_for_issue(safe_id, worker_host),
+    do: workspace_path_for_issue(safe_id, worker_host, current_workspace_root(worker_host))
+
+  defp workspace_path_for_issue(safe_id, nil, workspace_root) when is_binary(safe_id) do
+    workspace_root
     |> Path.join(safe_id)
     |> PathSafety.canonicalize()
   end
 
-  defp workspace_path_for_issue(safe_id, worker_host) when is_binary(safe_id) and is_binary(worker_host) do
-    {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
+  defp workspace_path_for_issue(safe_id, worker_host, workspace_root)
+       when is_binary(safe_id) and is_binary(worker_host) do
+    {:ok, Path.join(workspace_root, safe_id)}
   end
 
   @doc """
@@ -286,9 +339,7 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 16)
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-    hooks = Config.settings!().hooks
-
+  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, hooks) do
     case created? do
       true ->
         case hooks.after_create do
@@ -296,7 +347,14 @@ defmodule SymphonyElixir.Workspace do
             :ok
 
           command ->
-            run_hook(command, workspace, issue_context, "after_create", worker_host)
+            run_hook(
+              command,
+              workspace,
+              issue_context,
+              "after_create",
+              worker_host,
+              hooks.timeout_ms
+            )
         end
 
       false ->
@@ -304,9 +362,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
+  defp cleanup_failed_new_workspace(_workspace, false, _worker_host, _timeout_ms), do: :ok
 
-  defp cleanup_failed_new_workspace(workspace, true, nil) do
+  defp cleanup_failed_new_workspace(workspace, true, nil, _timeout_ms) do
     case File.rm_rf(workspace) do
       {:ok, _removed} ->
         :ok
@@ -316,10 +374,11 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp cleanup_failed_new_workspace(workspace, true, worker_host) when is_binary(worker_host) do
+  defp cleanup_failed_new_workspace(workspace, true, worker_host, timeout_ms)
+       when is_binary(worker_host) do
     script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, {_output, 0}} ->
         :ok
 
@@ -394,9 +453,18 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil) do
-    timeout_ms = Config.settings!().hooks.timeout_ms
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host) do
+    run_hook(
+      command,
+      workspace,
+      issue_context,
+      hook_name,
+      worker_host,
+      Config.settings!().hooks.timeout_ms
+    )
+  end
 
+  defp run_hook(command, workspace, issue_context, hook_name, nil, timeout_ms) do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
@@ -417,9 +485,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
-    timeout_ms = Config.settings!().hooks.timeout_ms
-
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, timeout_ms)
+       when is_binary(worker_host) do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
     case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
@@ -433,6 +500,22 @@ defmodule SymphonyElixir.Workspace do
         {:error, reason}
     end
   end
+
+  defp execution_settings(%{enabled: true, execution_settings: settings}), do: settings
+  defp execution_settings(_attempt_fuse), do: Config.settings!()
+
+  defp execution_workspace_root(%{enabled: true, workspace_root: root}, _settings, nil), do: root
+
+  defp execution_workspace_root(%{enabled: true}, settings, worker_host)
+       when is_binary(worker_host),
+       do: settings.workspace.root
+
+  defp execution_workspace_root(_attempt_fuse, _settings, worker_host),
+    do: current_workspace_root(worker_host)
+
+  defp current_workspace_root(nil), do: Config.local_workspace_root()
+  defp current_workspace_root([]), do: Config.local_workspace_root()
+  defp current_workspace_root(_worker), do: Config.settings!().workspace.root
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
     :ok
