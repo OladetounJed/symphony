@@ -100,11 +100,19 @@ defmodule SymphonyElixir.AppServerTest do
           3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-timeout"}}}' ;;
           4)
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-timeout"}}}'
-            sleep 0.15
+            sleep 0.1
             printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"one"}}}'
-            sleep 0.15
+            sleep 0.1
             printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
-            sleep 0.15
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"three"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"four"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"five"}}}'
+            sleep 0.1
+            printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"six"}}}'
+            sleep 0.1
             printf '%s\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -118,7 +126,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_turn_timeout_ms: 250
+        codex_turn_timeout_ms: 500
       )
 
       issue = %Issue{
@@ -144,7 +152,7 @@ defmodule SymphonyElixir.AppServerTest do
           3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-silent"}}}' ;;
           4)
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-silent"}}}'
-            sleep 0.4
+            sleep 0.8
             printf '%s\n' '{"method":"turn/completed"}'
             exit 0
             ;;
