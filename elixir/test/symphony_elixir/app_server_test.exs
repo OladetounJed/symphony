@@ -1546,6 +1546,76 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "remote launch rechecks containment in the same shell before Codex exec" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-remote-launch-retarget-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_marker = System.get_env("SYMP_TEST_CODEX_MARKER")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_CODEX_MARKER", previous_marker)
+    end)
+
+    try do
+      remote_root = Path.join(test_root, "remote-workspaces")
+      remote_workspace = Path.join(remote_root, "MT-REMOTE-RETARGET")
+      outside = Path.join(test_root, "outside")
+      marker = Path.join(test_root, "codex-started")
+      fake_ssh = Path.join(test_root, "ssh")
+      fake_codex = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(remote_workspace)
+      File.mkdir_p!(outside)
+      System.put_env("SYMP_TEST_CODEX_MARKER", marker)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_codex, """
+      #!/bin/sh
+      : > "$SYMP_TEST_CODEX_MARKER"
+      exit 1
+      """)
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      last=''
+      for argument in "$@"; do last="$argument"; done
+      case "$last" in
+        *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+          eval "$last"
+          status=$?
+          rm -rf '#{remote_workspace}'
+          ln -s '#{outside}' '#{remote_workspace}'
+          exit "$status"
+          ;;
+        *)
+          eval "$last"
+          ;;
+      esac
+      """)
+
+      File.chmod!(fake_codex, 0o755)
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: remote_root,
+        codex_command: "#{fake_codex} app-server"
+      )
+
+      assert {:error, _reason} =
+               AppServer.start_session(remote_workspace, worker_host: "worker-01")
+
+      refute File.exists?(marker)
+      assert {:ok, %File.Stat{type: :symlink}} = File.lstat(remote_workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server launches over ssh for remote workers" do
     test_root =
       Path.join(

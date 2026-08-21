@@ -483,6 +483,68 @@ defmodule SymphonyElixir.AttemptFuseTest do
     refute cleanup_trace =~ "rm -rf"
   end
 
+  test "recorded remote cleanup rechecks containment in the deletion shell" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-fuse-remote-delete-retarget-#{System.unique_integer([:positive])}"
+      )
+
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
+    remote_root = Path.join(root, "remote-workspaces")
+    remote_workspace = Path.join(remote_root, "GH-REMOTE-DELETE")
+    outside = Path.join(root, "outside")
+    outside_marker = Path.join(outside, "keep")
+    fake_ssh = Path.join(root, "ssh")
+    validation_count = Path.join(root, "validation-count")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(root)
+    end)
+
+    File.mkdir_p!(remote_workspace)
+    File.mkdir_p!(outside)
+    File.write!(outside_marker, "keep")
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    last=''
+    for argument in "$@"; do last="$argument"; done
+    case "$last" in
+      *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+        eval "$last"
+        status=$?
+        count=0
+        if [ -f '#{validation_count}' ]; then count=$(cat '#{validation_count}'); fi
+        count=$((count + 1))
+        printf '%s' "$count" > '#{validation_count}'
+        if [ "$count" -eq 2 ]; then
+          rm -rf '#{remote_workspace}'
+          ln -s '#{outside}' '#{remote_workspace}'
+        fi
+        exit "$status"
+        ;;
+      *)
+        eval "$last"
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    write_attempt_workflow!(workflow_path, root, port, remote_root)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:workspace_remove_failed, "worker-01", 74, _output}, ""} =
+             Workspace.remove_recorded(remote_workspace, "worker-01")
+
+    assert File.read!(outside_marker) == "keep"
+    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(remote_workspace)
+  end
+
   defp write_attempt_workflow!(path, root, port, workspace_root \\ nil, opts \\ []) do
     workspace_root = workspace_root || Path.join(root, "workspaces")
     source_revision = Keyword.get(opts, :source_revision, String.duplicate("a", 40))
