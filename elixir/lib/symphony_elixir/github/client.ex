@@ -35,9 +35,21 @@ defmodule SymphonyElixir.GitHub.Client do
     fetch_issues_by_states(state_names, Config.settings!().tracker, &perform_request/5)
   end
 
+  @spec fetch_issues_by_states([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(state_names, tracker_settings) when is_list(state_names) do
+    fetch_issues_by_states(state_names, tracker_settings, &perform_request/5)
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) when is_list(issue_ids) do
     fetch_issues_by_ids(issue_ids, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, tracker_settings) when is_list(issue_ids) do
+    fetch_issues_by_ids(issue_ids, tracker_settings, &perform_request/5)
   end
 
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::

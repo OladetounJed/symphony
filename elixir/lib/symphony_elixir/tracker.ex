@@ -40,9 +40,33 @@ defmodule SymphonyElixir.Tracker do
     adapter().fetch_issues_by_states(states)
   end
 
+  @spec fetch_issues_by_states([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if function_exported?(adapter, :fetch_issues_by_states, 2) do
+      adapter.fetch_issues_by_states(states, tracker_settings)
+    else
+      adapter.fetch_issues_by_states(states)
+    end
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
+
+    if function_exported?(adapter, :fetch_issues_by_ids, 2) do
+      adapter.fetch_issues_by_ids(issue_ids, tracker_settings)
+    else
+      adapter.fetch_issues_by_ids(issue_ids)
+    end
   end
 
   @doc """

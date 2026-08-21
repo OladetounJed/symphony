@@ -1196,20 +1196,9 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   defp confirm_activation_label_absent(context, tracker_settings, request_fun) do
     case github_request("GET", issue_path(context), %{}, nil, tracker_settings, request_fun) do
       {:ok, %{status: 200, body: issue}} when is_map(issue) ->
-        labels =
-          issue
-          |> Map.get("labels", [])
-          |> Enum.flat_map(fn
-            %{"name" => name} when is_binary(name) -> [name]
-            name when is_binary(name) -> [name]
-            _ -> []
-          end)
-          |> Enum.map(&(String.trim(&1) |> String.downcase()))
-
-        if String.downcase(context.activation_label) in labels do
-          {:error, :github_attempt_deactivation_unconfirmed}
-        else
-          :ok
+        case normalized_issue_labels(issue) do
+          {:ok, labels} -> confirm_label_absence(labels, context.activation_label)
+          {:error, reason} -> {:error, reason}
         end
 
       {:ok, %{status: status}} when is_integer(status) ->
@@ -1217,6 +1206,30 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
       {:error, reason} ->
         {:error, {:github_attempt_deactivation_confirm_request, reason}}
+    end
+  end
+
+  defp normalized_issue_labels(%{"labels" => labels}) when is_list(labels) do
+    normalized =
+      labels
+      |> Enum.flat_map(fn
+        %{"name" => name} when is_binary(name) -> [name]
+        name when is_binary(name) -> [name]
+        _ -> []
+      end)
+      |> Enum.map(&(String.trim(&1) |> String.downcase()))
+
+    {:ok, normalized}
+  end
+
+  defp normalized_issue_labels(_issue),
+    do: {:error, :github_attempt_deactivation_confirm_payload}
+
+  defp confirm_label_absence(labels, activation_label) do
+    if String.downcase(activation_label) in labels do
+      {:error, :github_attempt_deactivation_unconfirmed}
+    else
+      :ok
     end
   end
 

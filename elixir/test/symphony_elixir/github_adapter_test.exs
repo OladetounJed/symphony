@@ -17,6 +17,18 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     end
   end
 
+  defmodule FakeBoundGitHubClient do
+    def fetch_issues_by_states(states, tracker_settings) do
+      send(self(), {:github_bound_states_called, states, tracker_settings})
+      {:ok, states}
+    end
+
+    def fetch_issues_by_ids(ids, tracker_settings) do
+      send(self(), {:github_bound_ids_called, ids, tracker_settings})
+      {:ok, ids}
+    end
+  end
+
   setup do
     github_client_module = Application.get_env(:symphony_elixir, :github_client_module)
 
@@ -63,6 +75,20 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"])
     assert_receive {:github_ids_called, ["42"]}
+
+    assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"], settings)
+    assert_receive {:github_states_called, ["open"]}
+
+    assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"], settings)
+    assert_receive {:github_ids_called, ["42"]}
+
+    Application.put_env(:symphony_elixir, :github_client_module, FakeBoundGitHubClient)
+
+    assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"], settings)
+    assert_receive {:github_bound_states_called, ["open"], ^settings}
+
+    assert {:ok, ["42"]} = GitHubAdapter.fetch_issues_by_ids(["42"], settings)
+    assert_receive {:github_bound_ids_called, ["42"], ^settings}
 
     assert [%{"name" => "github_api"}] = GitHubAdapter.agent_tool_specs()
 

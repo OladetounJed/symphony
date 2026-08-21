@@ -35,9 +35,33 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states), do: client_module().fetch_issues_by_states(states)
 
+  @spec fetch_issues_by_states([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, tracker_settings) do
+    client = client_module()
+
+    if function_exported?(client, :fetch_issues_by_states, 2) do
+      client.fetch_issues_by_states(states, tracker_settings)
+    else
+      client.fetch_issues_by_states(states)
+    end
+  end
+
   @impl true
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids), do: client_module().fetch_issues_by_ids(issue_ids)
+
+  @spec fetch_issues_by_ids([String.t()], map() | struct()) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, tracker_settings) do
+    client = client_module()
+
+    if function_exported?(client, :fetch_issues_by_ids, 2) do
+      client.fetch_issues_by_ids(issue_ids, tracker_settings)
+    else
+      client.fetch_issues_by_ids(issue_ids)
+    end
+  end
 
   @impl true
   @spec agent_tool_specs() :: [map()]
