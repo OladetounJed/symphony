@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{AttemptFuse, Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_workspace_validation_marker "__SYMPHONY_REMOTE_WORKSPACE_VALID__"
 
   @type worker_host :: String.t() | nil
 
@@ -33,7 +34,12 @@ defmodule SymphonyElixir.Workspace do
            :ok <- validate_workspace_path(workspace, worker_host, workspace_root),
            :ok <- validate_attempt_fuse(attempt_fuse),
            {:ok, workspace, created?} <-
-             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms) do
+             ensure_workspace(
+               workspace,
+               worker_host,
+               workspace_root,
+               settings.hooks.timeout_ms
+             ) do
         result =
           with :ok <- notify_workspace_boundary(:prepared, workspace, worker_host),
                :ok <- validate_attempt_fuse(attempt_fuse),
@@ -43,9 +49,18 @@ defmodule SymphonyElixir.Workspace do
                    issue_context,
                    created?,
                    worker_host,
-                   settings.hooks
-                 ) do
-            {:ok, workspace}
+                   settings.hooks,
+                   workspace_root
+                 ),
+               {:ok, validated_workspace} <-
+                 validate_prepared_workspace(
+                   workspace,
+                   worker_host,
+                   workspace_root,
+                   settings.hooks.timeout_ms
+                 ),
+               :ok <- validate_attempt_fuse(attempt_fuse) do
+            {:ok, validated_workspace}
           end
 
         case result do
@@ -54,7 +69,8 @@ defmodule SymphonyElixir.Workspace do
               workspace,
               created?,
               worker_host,
-              settings.hooks.timeout_ms
+              settings.hooks.timeout_ms,
+              workspace_root
             )
 
             error
@@ -70,7 +86,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil, _timeout_ms) do
+  defp ensure_workspace(workspace, nil, _workspace_root, _timeout_ms) do
     cond do
       File.dir?(workspace) ->
         {:ok, workspace, false}
@@ -84,11 +100,13 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, worker_host, timeout_ms) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, workspace_root, timeout_ms)
+       when is_binary(worker_host) and is_binary(workspace_root) do
     script =
       [
         "set -eu",
         remote_shell_assign("workspace", workspace),
+        remote_shell_assign("workspace_root", workspace_root),
         "if [ -d \"$workspace\" ]; then",
         "  created=0",
         "elif [ -e \"$workspace\" ]; then",
@@ -99,15 +117,15 @@ defmodule SymphonyElixir.Workspace do
         "  mkdir -p \"$workspace\"",
         "  created=1",
         "fi",
-        "cd \"$workspace\"",
-        "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\""
+        remote_workspace_guard_script(workspace, workspace_root),
+        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$workspace_root\" \"$workspace\""
       ]
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
     case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, {output, 0}} ->
-        parse_remote_workspace_output(output)
+        parse_remote_workspace_output(output, Path.basename(workspace))
 
       {:ok, {output, status}} ->
         {:error, {:workspace_prepare_failed, worker_host, status, output}}
@@ -158,21 +176,53 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+    remove_remote_workspace(
+      workspace,
+      worker_host,
+      current_workspace_root(worker_host),
+      Config.settings!().hooks
+    )
+  end
 
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
+  defp remove_remote_workspace(workspace, worker_host, workspace_root, hooks)
+       when is_binary(workspace) and is_binary(worker_host) and is_binary(workspace_root) do
+    with {:ok, canonical_workspace} <-
+           validate_remote_workspace(workspace, workspace_root, worker_host, hooks.timeout_ms),
+         :ok <-
+           maybe_run_before_remove_hook(
+             canonical_workspace,
+             worker_host,
+             workspace_root,
+             hooks
+           ),
+         {:ok, ^canonical_workspace} <-
+           validate_remote_workspace(
+             canonical_workspace,
+             workspace_root,
+             worker_host,
+             hooks.timeout_ms
+           ) do
+      script =
+        [
+          "set -eu",
+          remote_workspace_guard_script(canonical_workspace, workspace_root),
+          "rm -rf \"$workspace\""
+        ]
+        |> Enum.join("\n")
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
+      case run_remote_command(worker_host, script, hooks.timeout_ms) do
+        {:ok, {_output, 0}} ->
+          {:ok, []}
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+        {:ok, {output, status}} ->
+          {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+
+        {:error, reason} ->
+          {:error, reason, ""}
+      end
+    else
+      {:ok, other_workspace} ->
+        {:error, {:remote_workspace_changed, workspace, other_workspace}, ""}
 
       {:error, reason} ->
         {:error, reason, ""}
@@ -196,7 +246,16 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    remove(workspace, worker_host)
+    if Path.type(workspace) == :absolute do
+      remove_remote_workspace(
+        workspace,
+        worker_host,
+        Path.dirname(workspace),
+        Config.settings!().hooks
+      )
+    else
+      {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+    end
   end
 
   def remove_recorded(workspace, _worker_host) do
@@ -274,21 +333,28 @@ defmodule SymphonyElixir.Workspace do
   def run_before_run_hook(workspace, issue_or_identifier, worker_host, attempt_fuse)
       when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = execution_settings(attempt_fuse).hooks
+    settings = execution_settings(attempt_fuse)
+    hooks = settings.hooks
+    workspace_root = execution_workspace_root(attempt_fuse, settings, worker_host)
 
     case hooks.before_run do
       nil ->
-        :ok
+        validate_hook_workspace(workspace, worker_host, workspace_root, hooks.timeout_ms)
 
       command ->
-        run_hook(
-          command,
-          workspace,
-          issue_context,
-          "before_run",
-          worker_host,
-          hooks.timeout_ms
-        )
+        with :ok <- validate_hook_workspace(workspace, worker_host, workspace_root, hooks.timeout_ms),
+             :ok <-
+               run_hook(
+                 command,
+                 workspace,
+                 issue_context,
+                 "before_run",
+                 worker_host,
+                 hooks.timeout_ms,
+                 workspace_root
+               ) do
+          validate_hook_workspace(workspace, worker_host, workspace_root, hooks.timeout_ms)
+        end
     end
   end
 
@@ -301,21 +367,27 @@ defmodule SymphonyElixir.Workspace do
   def run_after_run_hook(workspace, issue_or_identifier, worker_host, attempt_fuse)
       when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = execution_settings(attempt_fuse).hooks
+    settings = execution_settings(attempt_fuse)
+    hooks = settings.hooks
+    workspace_root = execution_workspace_root(attempt_fuse, settings, worker_host)
 
     case hooks.after_run do
       nil ->
         :ok
 
       command ->
-        run_hook(
-          command,
-          workspace,
-          issue_context,
-          "after_run",
-          worker_host,
-          hooks.timeout_ms
-        )
+        with :ok <-
+               validate_hook_workspace(workspace, worker_host, workspace_root, hooks.timeout_ms) do
+          run_hook(
+            command,
+            workspace,
+            issue_context,
+            "after_run",
+            worker_host,
+            hooks.timeout_ms,
+            workspace_root
+          )
+        end
         |> ignore_hook_failure()
     end
   end
@@ -364,7 +436,14 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 16)
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, hooks) do
+  defp maybe_run_after_create_hook(
+         workspace,
+         issue_context,
+         created?,
+         worker_host,
+         hooks,
+         workspace_root
+       ) do
     case created? do
       true ->
         case hooks.after_create do
@@ -378,7 +457,8 @@ defmodule SymphonyElixir.Workspace do
               issue_context,
               "after_create",
               worker_host,
-              hooks.timeout_ms
+              hooks.timeout_ms,
+              workspace_root
             )
         end
 
@@ -387,9 +467,10 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp cleanup_failed_new_workspace(_workspace, false, _worker_host, _timeout_ms), do: :ok
+  defp cleanup_failed_new_workspace(_workspace, false, _worker_host, _timeout_ms, _workspace_root),
+    do: :ok
 
-  defp cleanup_failed_new_workspace(workspace, true, nil, _timeout_ms) do
+  defp cleanup_failed_new_workspace(workspace, true, nil, _timeout_ms, _workspace_root) do
     case File.rm_rf(workspace) do
       {:ok, _removed} ->
         :ok
@@ -399,9 +480,15 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp cleanup_failed_new_workspace(workspace, true, worker_host, timeout_ms)
-       when is_binary(worker_host) do
-    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
+  defp cleanup_failed_new_workspace(workspace, true, worker_host, timeout_ms, workspace_root)
+       when is_binary(worker_host) and is_binary(workspace_root) do
+    script =
+      [
+        "set -eu",
+        remote_workspace_guard_script(workspace, workspace_root),
+        "rm -rf \"$workspace\""
+      ]
+      |> Enum.join("\n")
 
     case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, {_output, 0}} ->
@@ -437,9 +524,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_before_remove_hook(workspace, worker_host) when is_binary(worker_host) do
-    hooks = Config.settings!().hooks
-
+  defp maybe_run_before_remove_hook(workspace, worker_host, workspace_root, hooks)
+       when is_binary(worker_host) and is_binary(workspace_root) do
     case hooks.before_remove do
       nil ->
         :ok
@@ -447,7 +533,8 @@ defmodule SymphonyElixir.Workspace do
       command ->
         script =
           [
-            remote_shell_assign("workspace", workspace),
+            "set -eu",
+            remote_workspace_guard_script(workspace, workspace_root),
             "if [ -d \"$workspace\" ]; then",
             "  cd \"$workspace\"",
             "  #{command}",
@@ -485,11 +572,12 @@ defmodule SymphonyElixir.Workspace do
       issue_context,
       hook_name,
       worker_host,
-      Config.settings!().hooks.timeout_ms
+      Config.settings!().hooks.timeout_ms,
+      current_workspace_root(worker_host)
     )
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil, timeout_ms) do
+  defp run_hook(command, workspace, issue_context, hook_name, nil, timeout_ms, _workspace_root) do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
@@ -510,11 +598,28 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host, timeout_ms)
-       when is_binary(worker_host) do
+  defp run_hook(
+         command,
+         workspace,
+         issue_context,
+         hook_name,
+         worker_host,
+         timeout_ms,
+         workspace_root
+       )
+       when is_binary(worker_host) and is_binary(workspace_root) do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script =
+      [
+        "set -eu",
+        remote_workspace_guard_script(workspace, workspace_root),
+        "cd \"$workspace\"",
+        command
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -580,13 +685,68 @@ defmodule SymphonyElixir.Workspace do
     validate_local_workspace_path(workspace, workspace_root)
   end
 
-  defp validate_workspace_path(workspace, worker_host, _workspace_root)
-       when is_binary(workspace) and is_binary(worker_host) do
+  defp validate_workspace_path(workspace, worker_host, workspace_root)
+       when is_binary(workspace) and is_binary(worker_host) and is_binary(workspace_root) do
+    validate_remote_path_inputs(workspace, workspace_root)
+  end
+
+  defp validate_prepared_workspace(workspace, nil, workspace_root, _timeout_ms) do
+    case validate_local_workspace_path(workspace, workspace_root) do
+      :ok -> {:ok, workspace}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_prepared_workspace(workspace, worker_host, workspace_root, timeout_ms)
+       when is_binary(workspace) and is_binary(worker_host) and is_binary(workspace_root) do
+    validate_remote_workspace(workspace, workspace_root, worker_host, timeout_ms)
+  end
+
+  defp validate_hook_workspace(_workspace, nil, _workspace_root, _timeout_ms), do: :ok
+
+  defp validate_hook_workspace(workspace, worker_host, workspace_root, timeout_ms)
+       when is_binary(worker_host) do
+    case validate_remote_workspace(workspace, workspace_root, worker_host, timeout_ms) do
+      {:ok, ^workspace} -> :ok
+      {:ok, other} -> {:error, {:remote_workspace_changed, workspace, other}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  @spec validate_remote_workspace(Path.t(), Path.t(), String.t(), pos_integer()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def validate_remote_workspace(workspace, workspace_root, worker_host, timeout_ms)
+      when is_binary(workspace) and is_binary(workspace_root) and is_binary(worker_host) and
+             is_integer(timeout_ms) and timeout_ms > 0 do
+    with :ok <- validate_remote_path_inputs(workspace, workspace_root) do
+      script =
+        [
+          "set -eu",
+          remote_workspace_guard_script(workspace, workspace_root),
+          "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_validation_marker}' \"$workspace_root\" \"$workspace\""
+        ]
+        |> Enum.join("\n")
+
+      case run_remote_command(worker_host, script, timeout_ms) do
+        {:ok, {output, 0}} ->
+          parse_remote_workspace_validation(output, Path.basename(workspace))
+
+        {:ok, {output, status}} ->
+          {:error, {:remote_workspace_validation_failed, worker_host, status, output}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp validate_remote_path_inputs(workspace, workspace_root) do
     cond do
-      String.trim(workspace) == "" ->
+      String.trim(workspace) == "" or String.trim(workspace_root) == "" ->
         {:error, {:workspace_path_unreadable, workspace, :empty}}
 
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
+      String.contains?(workspace <> workspace_root, ["\n", "\r", "\t", <<0>>]) ->
         {:error, {:workspace_path_unreadable, workspace, :invalid_characters}}
 
       true ->
@@ -639,14 +799,34 @@ defmodule SymphonyElixir.Workspace do
     |> Enum.join("\n")
   end
 
-  defp parse_remote_workspace_output(output) do
+  @doc false
+  @spec remote_workspace_guard_script(Path.t(), Path.t()) :: String.t()
+  def remote_workspace_guard_script(workspace, workspace_root)
+      when is_binary(workspace) and is_binary(workspace_root) do
+    [
+      remote_shell_assign("workspace", workspace),
+      remote_shell_assign("workspace_root", workspace_root),
+      "case \"$workspace$workspace_root\" in *$'\\n'*|*$'\\r'*|*$'\\t'*) exit 71 ;; esac",
+      "[ -d \"$workspace_root\" ] || exit 72",
+      "[ -d \"$workspace\" ] || exit 73",
+      "workspace_root=$(cd \"$workspace_root\" && pwd -P)",
+      "workspace_key=${workspace%/}",
+      "workspace_key=${workspace_key##*/}",
+      "workspace=$(cd \"$workspace\" && pwd -P)",
+      "[ \"$workspace\" = \"$workspace_root/$workspace_key\" ] || exit 74"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp parse_remote_workspace_output(output, expected_key) do
     lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
 
     payload =
       Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
-          [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
-            {created == "1", path}
+        case String.split(line, "\t", parts: 4) do
+          [@remote_workspace_marker, created, root, path]
+          when created in ["0", "1"] and root != "" and path != "" ->
+            {created == "1", root, path}
 
           _ ->
             nil
@@ -654,11 +834,58 @@ defmodule SymphonyElixir.Workspace do
       end)
 
     case payload do
-      {created?, workspace} when is_boolean(created?) and is_binary(workspace) ->
-        {:ok, workspace, created?}
+      {created?, root, workspace} when is_boolean(created?) ->
+        case validate_remote_workspace_payload(root, workspace, expected_key) do
+          :ok -> {:ok, workspace, created?}
+          {:error, _reason} = error -> error
+        end
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  defp parse_remote_workspace_validation(output, expected_key) do
+    lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
+
+    payload =
+      Enum.find_value(lines, fn line ->
+        case String.split(line, "\t", parts: 3) do
+          [@remote_workspace_validation_marker, root, workspace]
+          when root != "" and workspace != "" ->
+            {root, workspace}
+
+          _ ->
+            nil
+        end
+      end)
+
+    case payload do
+      {root, workspace} ->
+        case validate_remote_workspace_payload(root, workspace, expected_key) do
+          :ok -> {:ok, workspace}
+          {:error, _reason} = error -> error
+        end
+
+      _ ->
+        {:error, {:remote_workspace_validation_failed, :invalid_output, output}}
+    end
+  end
+
+  defp validate_remote_workspace_payload(root, workspace, expected_key)
+       when is_binary(root) and is_binary(workspace) and is_binary(expected_key) do
+    cond do
+      Path.type(root) != :absolute or Path.type(workspace) != :absolute ->
+        {:error, {:remote_workspace_validation_failed, :non_absolute, root, workspace}}
+
+      Path.dirname(workspace) != root ->
+        {:error, {:remote_workspace_validation_failed, :outside_root, root, workspace}}
+
+      Path.basename(workspace) != expected_key ->
+        {:error, {:remote_workspace_validation_failed, :unexpected_key, expected_key, workspace}}
+
+      true ->
+        :ok
     end
   end
 

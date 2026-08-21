@@ -465,6 +465,9 @@ Fields:
   - The frozen workspace/hooks, worker and agent limits, Codex authority, tracker tool, and
     secret-scrub boundary MUST be carried into an already-reserved worker and revalidated at the
     session boundary.
+  - Remote workspaces MUST resolve on the worker to the exact direct child of the frozen remote
+    root. Canonical containment MUST be revalidated after hooks, immediately before coding-agent
+    launch, and before recorded cleanup.
   - Local quarantine and remote eligibility removal MUST be attempted independently. If neither
     durable barrier can be established, polling MUST remain suspended until operator reset.
 - `instance_lock_port` (optional positive integer; downstream extension)

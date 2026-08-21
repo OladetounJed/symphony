@@ -3,7 +3,8 @@ thresholds = %{
   "SymphonyElixir.Orchestrator" => 70.0,
   "SymphonyElixir.AgentRunner" => 70.0,
   "SymphonyElixir.Codex.AppServer" => 75.0,
-  "SymphonyElixir.Codex.DynamicTool" => 90.0
+  "SymphonyElixir.Codex.DynamicTool" => 90.0,
+  "SymphonyElixir.Workspace" => 70.0
 }
 
 Enum.each(thresholds, fn {module, threshold} ->

@@ -322,7 +322,10 @@ defmodule SymphonyElixir.AttemptFuseTest do
     printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
     case "$*" in
       *"__SYMPHONY_WORKSPACE__"*)
-        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{remote_workspace}'
+        printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{remote_root}' '#{remote_workspace}'
+        ;;
+      *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '#{remote_root}' '#{remote_workspace}'
         ;;
     esac
     exit 0
@@ -369,6 +372,115 @@ defmodule SymphonyElixir.AttemptFuseTest do
              Workspace.create_for_issue("GH-REMOTE-CLEANUP", "worker-01", frozen)
 
     assert File.read!(trace) =~ hook
+  end
+
+  test "remote workspace preparation rejects a canonical symlink escape" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-fuse-remote-symlink-#{System.unique_integer([:positive])}"
+      )
+
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
+    trace = Path.join(root, "ssh.trace")
+    fake_ssh = Path.join(root, "ssh")
+    remote_root = "/remote/workspaces"
+    remote_workspace = Path.join(remote_root, "GH-REMOTE-SYMLINK")
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(root)
+    end)
+
+    File.mkdir_p!(root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace)
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+    case "$*" in
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '0' '#{remote_root}' '/home/worker'
+        ;;
+    esac
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    write_attempt_workflow!(workflow_path, root, port, remote_root)
+    assert :ok = WorkflowStore.force_reload()
+    frozen = AttemptFuse.current_snapshot()
+
+    assert {:error, {:remote_workspace_validation_failed, :outside_root, ^remote_root, "/home/worker"}} =
+             Workspace.create_for_issue("GH-REMOTE-SYMLINK", "worker-01", frozen)
+
+    trace_output = File.read!(trace)
+    assert trace_output =~ remote_workspace
+    refute trace_output =~ "codex app-server"
+  end
+
+  test "post-hook remote workspace retarget fails closed and recorded cleanup never removes it" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-fuse-remote-retarget-#{System.unique_integer([:positive])}"
+      )
+
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
+    trace = Path.join(root, "ssh.trace")
+    fake_ssh = Path.join(root, "ssh")
+    remote_root = "/remote/workspaces"
+    remote_workspace = Path.join(remote_root, "GH-REMOTE-RETARGET")
+    hook = "echo after-create-retarget"
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(root)
+    end)
+
+    File.mkdir_p!(root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace)
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+    case "$*" in
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{remote_root}' '#{remote_workspace}'
+        ;;
+      *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '#{remote_root}' '/home/worker'
+        ;;
+    esac
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    write_attempt_workflow!(workflow_path, root, port, remote_root, hook_after_create: hook)
+    assert :ok = WorkflowStore.force_reload()
+    frozen = AttemptFuse.current_snapshot()
+
+    assert {:error, {:remote_workspace_validation_failed, :outside_root, ^remote_root, "/home/worker"}} =
+             Workspace.create_for_issue("GH-REMOTE-RETARGET", "worker-01", frozen)
+
+    trace_after_create = File.read!(trace)
+    assert trace_after_create =~ hook
+
+    assert {:error, {:remote_workspace_validation_failed, :outside_root, ^remote_root, "/home/worker"}, ""} =
+             Workspace.remove_recorded(remote_workspace, "worker-01")
+
+    cleanup_trace = File.read!(trace) |> String.replace(trace_after_create, "")
+    refute cleanup_trace =~ "rm -rf"
   end
 
   defp write_attempt_workflow!(path, root, port, workspace_root \\ nil, opts \\ []) do

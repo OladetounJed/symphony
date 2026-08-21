@@ -1630,7 +1630,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       case "$*" in
         *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
+          printf '%s\\t%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces' '#{workspace_path}'
+          ;;
+        *"__SYMPHONY_REMOTE_WORKSPACE_VALID__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_REMOTE_WORKSPACE_VALID__' '/remote/home/.symphony-remote-workspaces' '#{workspace_path}'
           ;;
       esac
 

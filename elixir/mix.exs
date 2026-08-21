@@ -72,7 +72,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Orchestrator.State,
           SymphonyElixir.AgentRunner,
           SymphonyElixir.Codex.AppServer,
-          SymphonyElixir.Codex.DynamicTool
+          SymphonyElixir.Codex.DynamicTool,
+          SymphonyElixir.Workspace
         ]
     else
       [SymphonyElixir.GitHub.AttemptLedger | modules]

@@ -26,7 +26,7 @@ lint:
 
 coverage:
 	$(MIX) test --cover --max-cases 1
-	SYMPHONY_ATTEMPT_FUSE_COVERAGE=1 $(MIX) test --cover test/symphony_elixir/attempt_fuse_test.exs test/symphony_elixir/github_attempt_ledger_test.exs test/symphony_elixir/instance_lock_test.exs test/symphony_elixir/github_adapter_test.exs test/symphony_elixir/orchestrator_attempt_fuse_test.exs test/symphony_elixir/core_test.exs test/symphony_elixir/app_server_test.exs test/symphony_elixir/dynamic_tool_test.exs
+	SYMPHONY_ATTEMPT_FUSE_COVERAGE=1 $(MIX) test --cover test/symphony_elixir/attempt_fuse_test.exs test/symphony_elixir/github_attempt_ledger_test.exs test/symphony_elixir/instance_lock_test.exs test/symphony_elixir/github_adapter_test.exs test/symphony_elixir/orchestrator_attempt_fuse_test.exs test/symphony_elixir/core_test.exs test/symphony_elixir/app_server_test.exs test/symphony_elixir/dynamic_tool_test.exs test/symphony_elixir/workspace_and_config_test.exs
 	$(ELIXIR) scripts/check_attempt_fuse_coverage.exs
 
 test:

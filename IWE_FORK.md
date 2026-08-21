@@ -49,6 +49,11 @@ GitHub Issues adapter:
   The frozen no-tools binding and tracker-secret scrub set are passed into the
   worker and revalidated before workspace creation and after hooks, so a hot
   reload cannot give an already-reserved session new tracker authority.
+- SSH workspaces are canonicalized on the worker and must resolve to the exact
+  direct child of the frozen remote root. That invariant is rechecked after
+  hooks, in the same shell immediately before Codex launch, and before recorded
+  cleanup, so a stale or retargeted symlink cannot widen the sandbox or redirect
+  deletion.
 
 ## Trust and availability boundary
 
@@ -62,9 +67,9 @@ the entire remote tail remains an administrative trust violation, not a
 supported recovery path.
 
 The normal suite retains upstream's 100% included-module threshold. The focused
-fuse profile re-includes the ledger, orchestrator, AgentRunner, AppServer, and
-dynamic-tool boundary with documented per-module line-coverage floors plus
-supervised no-network rehearsal coverage.
+fuse profile re-includes the ledger, orchestrator, AgentRunner, AppServer,
+Workspace, and dynamic-tool boundaries with documented per-module line-coverage
+floors plus supervised no-network rehearsal coverage.
 
 The checked-in ìwé workflow keeps the ledger disabled until the real bot and
 App IDs are provisioned in the separately reviewed live-pilot task. Disabled,

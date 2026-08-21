@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{AttemptFuse, Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{AttemptFuse, Codex.DynamicTool, Config, PathSafety, SSH, Workspace}
 
   @initialize_id 1
   @thread_start_id 2
@@ -49,14 +49,20 @@ defmodule SymphonyElixir.Codex.AppServer do
            execution_workspace_root(attempt_fuse, execution_settings, worker_host),
          {:ok, dynamic_tool_binding} <- session_tool_binding(opts, attempt_fuse),
          {:ok, expanded_workspace} <-
-           validate_workspace_cwd(workspace, worker_host, workspace_root),
+           validate_workspace_cwd(
+             workspace,
+             worker_host,
+             workspace_root,
+             execution_settings.hooks.timeout_ms
+           ),
          :ok <- validate_attempt_fuse(attempt_fuse),
          {:ok, port} <-
            start_port(
              expanded_workspace,
              worker_host,
              dynamic_tool_binding,
-             execution_settings.codex.command
+             execution_settings.codex.command,
+             workspace_root
            ) do
       metadata = port_metadata(port, worker_host)
 
@@ -233,7 +239,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port)
   end
 
-  defp validate_workspace_cwd(workspace, nil, workspace_root)
+  defp validate_workspace_cwd(workspace, nil, workspace_root, _timeout_ms)
        when is_binary(workspace) and is_binary(workspace_root) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Path.expand(workspace_root)
@@ -262,8 +268,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host, _workspace_root)
-       when is_binary(workspace) and is_binary(worker_host) do
+  defp validate_workspace_cwd(workspace, worker_host, workspace_root, timeout_ms)
+       when is_binary(workspace) and is_binary(worker_host) and is_binary(workspace_root) do
     cond do
       String.trim(workspace) == "" ->
         {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
@@ -272,11 +278,19 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
 
       true ->
-        {:ok, workspace}
+        case Workspace.validate_remote_workspace(
+               workspace,
+               workspace_root,
+               worker_host,
+               timeout_ms
+             ) do
+          {:ok, validated_workspace} -> {:ok, validated_workspace}
+          {:error, reason} -> {:error, {:invalid_workspace_cwd, :remote_validation, reason}}
+        end
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding, codex_command) do
+  defp start_port(workspace, nil, dynamic_tool_binding, codex_command, _workspace_root) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -303,9 +317,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding, codex_command)
-       when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding, codex_command)
+  defp start_port(workspace, worker_host, dynamic_tool_binding, codex_command, workspace_root)
+       when is_binary(worker_host) and is_binary(workspace_root) do
+    remote_command =
+      remote_launch_command(workspace, workspace_root, dynamic_tool_binding, codex_command)
+
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
@@ -318,10 +334,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding, codex_command)
-       when is_binary(workspace) do
+  defp remote_launch_command(workspace, workspace_root, dynamic_tool_binding, codex_command)
+       when is_binary(workspace) and is_binary(workspace_root) do
     [
-      "cd #{shell_escape(workspace)}",
+      "set -eu",
+      Workspace.remote_workspace_guard_script(workspace, workspace_root),
+      "cd \"$workspace\"",
       tracker_secret_unset_command(dynamic_tool_binding),
       "exec #{codex_command}"
     ]
@@ -1122,10 +1140,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
-
-  defp shell_escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
-  end
 
   defp default_on_message(_message), do: :ok
 
