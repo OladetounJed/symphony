@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{AttemptFuse, Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -26,11 +26,14 @@ defmodule SymphonyElixir.Workspace do
     try do
       safe_id = workspace_key(issue_or_identifier)
 
-      with {:ok, workspace} <-
+      with :ok <- validate_attempt_fuse(attempt_fuse),
+           {:ok, workspace} <-
              workspace_path_for_issue(safe_id, worker_host, workspace_root),
-           :ok <- validate_workspace_path(workspace, worker_host),
+           :ok <- validate_workspace_path(workspace, worker_host, workspace_root),
+           :ok <- validate_attempt_fuse(attempt_fuse),
            {:ok, workspace, created?} <-
-             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms) do
+             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms),
+           :ok <- validate_attempt_fuse(attempt_fuse) do
         case maybe_run_after_create_hook(
                workspace,
                issue_context,
@@ -114,6 +117,13 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
+
+  @doc false
+  @spec validate_workspace_path_for_test(Path.t(), Path.t()) :: :ok | {:error, term()}
+  def validate_workspace_path_for_test(workspace, workspace_root)
+      when is_binary(workspace) and is_binary(workspace_root) do
+    validate_local_workspace_path(workspace, workspace_root)
+  end
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
@@ -504,6 +514,11 @@ defmodule SymphonyElixir.Workspace do
   defp execution_settings(%{enabled: true, execution_settings: settings}), do: settings
   defp execution_settings(_attempt_fuse), do: Config.settings!()
 
+  defp validate_attempt_fuse(nil), do: :ok
+
+  defp validate_attempt_fuse(attempt_fuse) when is_map(attempt_fuse),
+    do: AttemptFuse.validate_current(attempt_fuse)
+
   defp execution_workspace_root(%{enabled: true, workspace_root: root}, _settings, nil), do: root
 
   defp execution_workspace_root(%{enabled: true}, settings, worker_host)
@@ -545,7 +560,12 @@ defmodule SymphonyElixir.Workspace do
     validate_local_workspace_path(workspace, Config.local_workspace_root())
   end
 
-  defp validate_workspace_path(workspace, worker_host)
+  defp validate_workspace_path(workspace, nil, workspace_root)
+       when is_binary(workspace) and is_binary(workspace_root) do
+    validate_local_workspace_path(workspace, workspace_root)
+  end
+
+  defp validate_workspace_path(workspace, worker_host, _workspace_root)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->

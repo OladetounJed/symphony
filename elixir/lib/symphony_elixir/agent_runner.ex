@@ -49,7 +49,8 @@ defmodule SymphonyElixir.AgentRunner do
     attempt_fuse = Keyword.get(opts, :attempt_fuse)
 
     with :ok <- validate_attempt_fuse(attempt_fuse),
-         {:ok, workspace} <- workspace_module().create_for_issue(issue, worker_host, attempt_fuse) do
+         {:ok, workspace} <- workspace_module().create_for_issue(issue, worker_host, attempt_fuse),
+         :ok <- validate_attempt_fuse(attempt_fuse) do
       send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
       try do
@@ -105,7 +106,18 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     execution_settings = Keyword.fetch!(opts, :execution_settings)
     max_turns = Keyword.get(opts, :max_turns, execution_settings.agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+
+    issue_state_fetcher =
+      Keyword.get(
+        opts,
+        :issue_state_fetcher,
+        fn ids ->
+          with {:ok, issues} <- Tracker.fetch_issues_by_ids(ids, execution_settings.tracker),
+               :ok <- validate_attempt_fuse(Keyword.get(opts, :attempt_fuse)) do
+            {:ok, issues}
+          end
+        end
+      )
 
     session_options =
       [worker_host: worker_host]

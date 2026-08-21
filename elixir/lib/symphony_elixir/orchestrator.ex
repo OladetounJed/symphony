@@ -1134,6 +1134,34 @@ defmodule SymphonyElixir.Orchestrator do
          recipient,
          worker_host
        ) do
+    if dispatch_operational?(state) do
+      do_start_reserved_worker(
+        state,
+        issue,
+        retry_attempt,
+        attempt_evidence,
+        recipient,
+        worker_host
+      )
+    else
+      state
+      |> block_attempt_dispatch(
+        issue,
+        {:dispatch_suspended_after_reservation, attempt_evidence},
+        attempt_evidence
+      )
+      |> suspend_dispatch()
+    end
+  end
+
+  defp do_start_reserved_worker(
+         %State{} = state,
+         issue,
+         retry_attempt,
+         attempt_evidence,
+         recipient,
+         worker_host
+       ) do
     prompt_attempt =
       case attempt_evidence do
         %{used: used} when is_integer(used) and used > 0 -> used

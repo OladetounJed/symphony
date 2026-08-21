@@ -178,6 +178,40 @@ defmodule SymphonyElixir.AttemptFuseTest do
     File.rm_rf(root)
   end
 
+  test "local workspace and App Server validators retain the frozen root across a broader live reload" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-fuse-root-validation-#{System.unique_integer([:positive])}"
+      )
+
+    frozen_root = Path.join(root, "frozen-workspaces")
+    outside = Path.join(root, "outside")
+    symlink_workspace = Path.join(frozen_root, "GH-42")
+
+    File.mkdir_p!(frozen_root)
+    File.mkdir_p!(outside)
+    File.ln_s!(outside, symlink_workspace)
+    {:ok, canonical_outside} = SymphonyElixir.PathSafety.canonicalize(outside)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+    assert :ok = WorkflowStore.force_reload()
+    assert Config.local_workspace_root() == root
+
+    assert :ok = Workspace.validate_workspace_path_for_test(symlink_workspace, root)
+
+    assert {:error, {:workspace_symlink_escape, ^symlink_workspace, _root}} =
+             Workspace.validate_workspace_path_for_test(symlink_workspace, frozen_root)
+
+    assert {:ok, ^canonical_outside} =
+             AppServer.validate_workspace_cwd_for_test(symlink_workspace, root)
+
+    assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
+             AppServer.validate_workspace_cwd_for_test(symlink_workspace, frozen_root)
+
+    File.rm_rf(root)
+  end
+
   defp write_attempt_workflow!(path, root, port, workspace_root \\ nil) do
     workspace_root = workspace_root || Path.join(root, "workspaces")
 

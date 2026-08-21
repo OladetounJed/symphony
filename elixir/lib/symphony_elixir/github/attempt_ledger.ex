@@ -1210,20 +1210,27 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   end
 
   defp normalized_issue_labels(%{"labels" => labels}) when is_list(labels) do
-    normalized =
-      labels
-      |> Enum.flat_map(fn
-        %{"name" => name} when is_binary(name) -> [name]
-        name when is_binary(name) -> [name]
-        _ -> []
-      end)
-      |> Enum.map(&(String.trim(&1) |> String.downcase()))
-
-    {:ok, normalized}
+    Enum.reduce_while(labels, {:ok, []}, &normalize_issue_label/2)
   end
 
   defp normalized_issue_labels(_issue),
     do: {:error, :github_attempt_deactivation_confirm_payload}
+
+  defp normalize_issue_label(%{"name" => name}, {:ok, acc}) when is_binary(name),
+    do: append_normalized_label(name, acc)
+
+  defp normalize_issue_label(name, {:ok, acc}) when is_binary(name),
+    do: append_normalized_label(name, acc)
+
+  defp normalize_issue_label(_label, _acc),
+    do: {:halt, {:error, :github_attempt_deactivation_confirm_payload}}
+
+  defp append_normalized_label(name, acc) do
+    case name |> String.trim() |> String.downcase() do
+      "" -> {:halt, {:error, :github_attempt_deactivation_confirm_payload}}
+      normalized -> {:cont, {:ok, [normalized | acc]}}
+    end
+  end
 
   defp confirm_label_absence(labels, activation_label) do
     if String.downcase(activation_label) in labels do

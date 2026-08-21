@@ -42,10 +42,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     attempt_fuse = Keyword.get(opts, :attempt_fuse)
     execution_settings = execution_settings(opts, attempt_fuse)
+    workspace_root = execution_workspace_root(attempt_fuse, execution_settings, worker_host)
 
     with :ok <- validate_attempt_fuse(attempt_fuse),
          {:ok, dynamic_tool_binding} <- session_tool_binding(opts, attempt_fuse),
-         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, expanded_workspace} <-
+           validate_workspace_cwd(workspace, worker_host, workspace_root),
+         :ok <- validate_attempt_fuse(attempt_fuse),
          {:ok, port} <-
            start_port(
              expanded_workspace,
@@ -57,6 +60,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with {:ok, session_policies} <-
              session_policies(expanded_workspace, worker_host, execution_settings),
+           :ok <- validate_attempt_fuse(attempt_fuse),
            {:ok, thread_id} <-
              do_start_session(
                port,
@@ -107,6 +111,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp execution_settings(opts, _attempt_fuse) do
     Keyword.get(opts, :execution_settings) || Config.settings!()
   end
+
+  defp execution_workspace_root(%{enabled: true, workspace_root: root}, _settings, nil), do: root
+
+  defp execution_workspace_root(%{enabled: true}, settings, worker_host)
+       when is_binary(worker_host),
+       do: settings.workspace.root
+
+  defp execution_workspace_root(_attempt_fuse, _settings, nil), do: Config.local_workspace_root()
+  defp execution_workspace_root(_attempt_fuse, settings, _worker_host), do: settings.workspace.root
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
@@ -204,9 +217,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port)
   end
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
+  @doc false
+  @spec validate_workspace_cwd_for_test(Path.t(), Path.t()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def validate_workspace_cwd_for_test(workspace, workspace_root)
+      when is_binary(workspace) and is_binary(workspace_root) do
+    validate_workspace_cwd(workspace, nil, workspace_root)
+  end
+
+  defp validate_workspace_cwd(workspace, nil, workspace_root)
+       when is_binary(workspace) and is_binary(workspace_root) do
     expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
+    expanded_root = Path.expand(workspace_root)
     expanded_root_prefix = expanded_root <> "/"
 
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
@@ -232,7 +254,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host)
+  defp validate_workspace_cwd(workspace, worker_host, _workspace_root)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
