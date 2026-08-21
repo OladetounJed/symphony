@@ -7,8 +7,10 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   but it never authorizes a worker start by itself.
   """
 
-  alias SymphonyElixir.{Config, PathSafety}
+  import Bitwise, only: [band: 2]
+
   alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.PathSafety
   alias SymphonyElixir.Tracker.Issue
 
   @attempt_marker "<!-- iwe-symphony-attempt:v1 -->\n"
@@ -42,6 +44,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
       %{} = raw_settings ->
         with :ok <- validate_agent_tool_setting(provider),
+             :ok <- validate_official_api_url(provider),
              {:ok, _settings} <- normalize_ledger_settings(raw_settings, false) do
           :ok
         end
@@ -51,30 +54,37 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     end
   end
 
-  @spec reserve(Issue.t(), pos_integer()) ::
+  @spec reserve(Issue.t(), pos_integer(), map()) ::
           {:ok, evidence()} | {:exhausted, evidence()} | {:error, term()}
-  def reserve(%Issue{} = issue, max_attempts)
-      when is_integer(max_attempts) and max_attempts > 0 do
-    tracker_settings = Config.settings!().tracker
-
+  def reserve(
+        %Issue{} = issue,
+        max_attempts,
+        %{tracker_settings: tracker_settings, workspace_root: workspace_root}
+      )
+      when is_integer(max_attempts) and max_attempts > 0 and is_map(tracker_settings) and
+             is_binary(workspace_root) do
     reserve_with(
       issue,
       max_attempts,
       tracker_settings,
       &Client.request/5,
-      workspace_root: Config.local_workspace_root()
+      workspace_root: workspace_root
     )
   end
 
-  @spec deactivate(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
-  def deactivate(%Issue{} = issue, evidence) when is_map(evidence) do
-    tracker_settings = Config.settings!().tracker
-
+  @spec deactivate(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def deactivate(
+        %Issue{} = issue,
+        evidence,
+        %{tracker_settings: tracker_settings, workspace_root: workspace_root}
+      )
+      when is_map(evidence) and is_map(tracker_settings) and is_binary(workspace_root) do
     deactivate_with(
       issue,
       evidence,
       tracker_settings,
-      &Client.request/5
+      &Client.request/5,
+      workspace_root: workspace_root
     )
   end
 
@@ -86,15 +96,16 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   end
 
   @doc false
-  @spec deactivate_for_test(Issue.t(), map(), map(), function()) ::
+  @spec deactivate_for_test(Issue.t(), map(), map(), function(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def deactivate_for_test(issue, evidence, tracker_settings, request_fun) do
-    deactivate_with(issue, evidence, tracker_settings, request_fun)
+  def deactivate_for_test(issue, evidence, tracker_settings, request_fun, opts \\ []) do
+    deactivate_with(issue, evidence, tracker_settings, request_fun, opts)
   end
 
   defp reserve_with(issue, max_attempts, tracker_settings, request_fun, opts) do
     with {:ok, settings} <- runtime_settings(tracker_settings, opts),
          {:ok, context} <- issue_context(issue, settings, max_attempts, tracker_settings),
+         :ok <- ensure_not_quarantined(context),
          {:ok, comments} <- fetch_all_comments(context, tracker_settings, request_fun),
          {:ok, ledger} <- validate_ledger(comments, context),
          {:ok, local_state} <- reconcile_high_water(context, ledger) do
@@ -117,10 +128,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     end
   end
 
-  defp deactivate_with(issue, evidence, tracker_settings, request_fun) do
-    with {:ok, settings} <- runtime_settings(tracker_settings, allow_disabled: true),
+  defp deactivate_with(issue, evidence, tracker_settings, request_fun, opts) do
+    with {:ok, max_attempts} <- evidence_max(evidence),
+         {:ok, settings} <- runtime_settings(tracker_settings, Keyword.put(opts, :allow_disabled, true)),
          {:ok, context} <-
-           issue_context(issue, settings, evidence_max(evidence), tracker_settings) do
+           issue_context(issue, settings, max_attempts, tracker_settings),
+         :ok <- write_quarantine(context, evidence) do
       exhaustion_result =
         ensure_exhaustion_evidence(context, evidence, tracker_settings, request_fun)
 
@@ -242,14 +255,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   defp reconcile_high_water_state(context, ledger, %{} = state),
     do: reconcile_existing_high_water(context, ledger, state)
 
-  defp reconcile_existing_high_water(context, ledger, state) do
+  defp reconcile_existing_high_water(_context, ledger, state) do
     pending = state["pending"]
 
     cond do
       is_map(pending) and reservation_present?(ledger, pending["reservation_id"]) ->
-        updated = high_water_state(context, ledger, nil)
-
-        with :ok <- write_high_water(context, updated), do: {:ok, updated}
+        {:ok, state}
 
       is_map(pending) ->
         {:ok, state}
@@ -343,38 +354,157 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   defp valid_pending?(_pending, _context, _state), do: false
 
   defp read_high_water(context) do
-    case File.read(context.high_water_path) do
-      {:ok, data} ->
-        case Jason.decode(data) do
-          {:ok, state} when is_map(state) -> {:ok, state}
-          _ -> {:error, :github_attempt_high_water_malformed}
-        end
-
-      {:error, :enoent} ->
-        {:ok, nil}
-
-      {:error, reason} ->
-        {:error, {:github_attempt_high_water_read, reason}}
-    end
+    read_local_json(
+      context.high_water_path,
+      :github_attempt_high_water_malformed,
+      :github_attempt_high_water_read
+    )
   end
 
   defp write_high_water(context, state) when is_map(state) do
-    directory = Path.dirname(context.high_water_path)
+    write_local_json(
+      context.high_water_path,
+      state,
+      :github_attempt_high_water_target,
+      :github_attempt_high_water_write
+    )
+  end
+
+  defp ensure_not_quarantined(context) do
+    case read_quarantine(context) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, quarantine} ->
+        with :ok <- validate_quarantine(quarantine, context), do: {:error, :github_attempt_quarantined}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_quarantine(context) do
+    read_local_json(
+      context.quarantine_path,
+      :github_attempt_quarantine_malformed,
+      :github_attempt_quarantine_read
+    )
+  end
+
+  defp write_quarantine(context, evidence) do
+    case read_quarantine(context) do
+      {:ok, nil} ->
+        quarantine = quarantine_state(context, evidence)
+
+        write_local_json(
+          context.quarantine_path,
+          quarantine,
+          :github_attempt_quarantine_target,
+          :github_attempt_quarantine_write
+        )
+
+      {:ok, quarantine} ->
+        validate_quarantine(quarantine, context)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp quarantine_state(context, evidence) do
+    %{
+      "schema" => 1,
+      "repository_id" => context.repository_id,
+      "issue_id" => context.issue_id,
+      "source_revision" => context.source_revision,
+      "max_attempts" => context.max_attempts,
+      "reason" => to_string(evidence_value(evidence, :reason, "reason", "attempt_dispatch_blocked")),
+      "created_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    }
+  end
+
+  defp validate_quarantine(quarantine, context) when is_map(quarantine) do
+    required_keys = [
+      "created_at",
+      "issue_id",
+      "max_attempts",
+      "reason",
+      "repository_id",
+      "schema",
+      "source_revision"
+    ]
+
+    with :ok <- require_exact_keys(quarantine, required_keys, :github_attempt_quarantine_malformed),
+         :ok <- require_equal(quarantine["schema"], 1, :github_attempt_quarantine_malformed),
+         :ok <-
+           require_all_equal(
+             [
+               {quarantine["repository_id"], context.repository_id},
+               {quarantine["issue_id"], context.issue_id},
+               {quarantine["source_revision"], context.source_revision},
+               {quarantine["max_attempts"], context.max_attempts}
+             ],
+             :github_attempt_quarantine_subject_mismatch
+           ),
+         :ok <- require_true(present_string?(quarantine["reason"]), :github_attempt_quarantine_malformed) do
+      require_true(present_string?(quarantine["created_at"]), :github_attempt_quarantine_malformed)
+    end
+  end
+
+  defp read_local_json(path, malformed_reason, read_reason) do
+    with :ok <- validate_local_target(path, malformed_reason) do
+      case File.read(path) do
+        {:ok, data} ->
+          decode_local_json(data, malformed_reason)
+
+        {:error, :enoent} ->
+          {:ok, nil}
+
+        {:error, reason} ->
+          {:error, {read_reason, reason}}
+      end
+    end
+  end
+
+  defp decode_local_json(data, malformed_reason) do
+    case Jason.decode(data) do
+      {:ok, state} when is_map(state) -> {:ok, state}
+      _ -> {:error, malformed_reason}
+    end
+  end
+
+  defp write_local_json(path, state, target_reason, write_reason) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
-    temporary_path = context.high_water_path <> ".#{suffix}.tmp"
+    temporary_path = path <> ".#{suffix}.tmp"
     encoded = Jason.encode!(state)
 
-    with :ok <- File.mkdir_p(directory),
+    with :ok <- validate_local_target(path, target_reason),
          :ok <- File.write(temporary_path, encoded, [:exclusive]),
          :ok <- File.chmod(temporary_path, 0o600),
-         :ok <- File.rename(temporary_path, context.high_water_path) do
+         :ok <- File.rename(temporary_path, path),
+         :ok <- validate_local_target(path, target_reason) do
       :ok
     else
       {:error, reason} ->
         _ = File.rm(temporary_path)
-        {:error, {:github_attempt_high_water_write, reason}}
+        {:error, normalize_local_write_error(reason, write_reason)}
     end
   end
+
+  defp validate_local_target(path, reason) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular, mode: mode}} when band(mode, 0o077) == 0 -> :ok
+      {:ok, _stat} -> {:error, reason}
+      {:error, :enoent} -> :ok
+      {:error, file_reason} -> {:error, file_reason}
+    end
+  end
+
+  defp normalize_local_write_error(reason, _write_reason)
+       when reason in [:github_attempt_high_water_target, :github_attempt_quarantine_target],
+       do: reason
+
+  defp normalize_local_write_error(reason, write_reason), do: {write_reason, reason}
 
   defp high_water_state(context, ledger, pending) do
     %{
@@ -725,11 +855,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
   end
 
   defp ensure_trusted_exhaustion_comment(context, evidence, tracker_settings, request_fun) do
-    event_data = exhaustion_data(context, evidence)
-    event_id = event_data["event_id"]
-
     with {:ok, comments} <- fetch_all_comments(context, tracker_settings, request_fun),
-         {:ok, ledger} <- validate_ledger(comments, context) do
+         {:ok, ledger} <- validate_ledger(comments, context),
+         event_data <- exhaustion_data(context, ledger, evidence),
+         :ok <- validate_exhaustion_data(event_data, context) do
+      event_id = event_data["event_id"]
+
       case Enum.filter(ledger.exhaustion_entries, &(&1.data["event_id"] == event_id)) do
         [entry] ->
           {:ok, %{evidence_url: entry.evidence_url}}
@@ -771,12 +902,25 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     end
   end
 
-  defp exhaustion_data(context, evidence) do
-    used = evidence_value(evidence, :used, "used", 0)
-    tip_comment_id = evidence_value(evidence, :tip_comment_id, "tip_comment_id", nil)
-    tip_digest = evidence_value(evidence, :tip_digest, "tip_digest", nil)
+  defp exhaustion_data(context, ledger, evidence) do
+    used = ledger.used
+    tip_comment_id = ledger.tip && ledger.tip.comment_id
+    tip_digest = ledger.tip && ledger.tip.digest
     reason = evidence_value(evidence, :reason, "reason", "max_attempts_exhausted")
-    event_seed = Enum.join([context.repository_id, context.issue_id, used, tip_comment_id, tip_digest, reason], ":")
+
+    event_seed =
+      Enum.join(
+        [
+          context.repository_id,
+          context.issue_id,
+          used,
+          tip_comment_id,
+          tip_digest,
+          context.max_attempts,
+          context.source_revision
+        ],
+        ":"
+      )
 
     %{
       "schema" => 1,
@@ -846,9 +990,28 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
            ),
          :ok <- require_non_negative_integer(data["used"], :github_attempt_exhaustion_used),
          :ok <- require_pattern(data["event_id"], @digest_pattern, :github_attempt_exhaustion_id),
+         :ok <- validate_exhaustion_event_id(data),
          :ok <- validate_exhaustion_tip_fields(data) do
       require_true(present_string?(data["reason"]), :github_attempt_exhaustion_reason)
     end
+  end
+
+  defp validate_exhaustion_event_id(data) do
+    seed =
+      Enum.join(
+        [
+          data["repository_id"],
+          data["issue_id"],
+          data["used"],
+          data["tip_comment_id"],
+          data["tip_digest"],
+          data["max_attempts"],
+          data["source_revision"]
+        ],
+        ":"
+      )
+
+    require_equal(data["event_id"], digest(seed), :github_attempt_exhaustion_id)
   end
 
   defp validate_exhaustion_subject(data, context) do
@@ -956,14 +1119,16 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
     provider = provider_settings(tracker_settings)
 
     with :ok <- validate_agent_tool_setting(provider),
+         :ok <- validate_official_api_url(provider),
          %{} = raw_settings <- provider["attempt_ledger"] || %{},
          {:ok, settings} <- normalize_ledger_settings(raw_settings, true),
          true <-
            settings.enabled or Keyword.get(opts, :allow_disabled, false) or
              {:error, :github_attempt_ledger_disabled},
          {:ok, high_water_root} <- resolve_high_water_root(settings.high_water_root, opts),
-         :ok <- validate_high_water_root(high_water_root, Keyword.get(opts, :workspace_root)) do
-      {:ok, Map.put(settings, :high_water_root, high_water_root)}
+         {:ok, secure_root} <-
+           prepare_high_water_root(high_water_root, Keyword.get(opts, :workspace_root)) do
+      {:ok, Map.put(settings, :high_water_root, secure_root)}
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_github_attempt_ledger}
@@ -1046,6 +1211,15 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
   defp validate_agent_tool_setting(_provider), do: :ok
 
+  defp validate_official_api_url(provider) do
+    case provider["api_url"] do
+      nil -> :ok
+      "https://api.github.com" -> :ok
+      "https://api.github.com/" -> :ok
+      _ -> {:error, :github_attempt_ledger_requires_official_api}
+    end
+  end
+
   defp resolve_high_water_root("$" <> env_name, opts) do
     if String.match?(env_name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/) do
       value = Keyword.get(opts, :high_water_root) || System.get_env(env_name)
@@ -1063,23 +1237,75 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
 
   defp resolve_high_water_root(_value, _opts), do: {:error, :github_attempt_high_water_root_missing}
 
-  defp validate_high_water_root(root, nil) do
-    case PathSafety.canonicalize(root) do
-      {:ok, _path} -> :ok
-      {:error, {:path_canonicalize_failed, _path, :enoent}} -> :ok
-      {:error, reason} -> {:error, reason}
+  defp prepare_high_water_root(root, workspace_root) do
+    with {:ok, canonical_root} <- PathSafety.canonicalize(root),
+         {:ok, canonical_workspace} <- canonical_workspace(workspace_root),
+         :ok <- validate_root_separation(canonical_root, canonical_workspace),
+         :ok <- File.mkdir_p(canonical_root),
+         :ok <- reject_symlink_components(canonical_root),
+         :ok <- File.chmod(canonical_root, 0o700),
+         :ok <- validate_secure_directory(canonical_root) do
+      {:ok, canonical_root}
+    else
+      {:error, {:path_canonicalize_failed, _path, reason}} ->
+        {:error, {:github_attempt_high_water_root_canonicalize, reason}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp validate_high_water_root(root, workspace_root) when is_binary(workspace_root) do
-    expanded_workspace = Path.expand(workspace_root)
-    root_prefix = root <> "/"
-    workspace_prefix = expanded_workspace <> "/"
+  defp canonical_workspace(nil), do: {:ok, nil}
+  defp canonical_workspace(path) when is_binary(path), do: PathSafety.canonicalize(path)
+  defp canonical_workspace(_path), do: {:error, :github_attempt_workspace_root_invalid}
 
-    if root == expanded_workspace or String.starts_with?(root_prefix, workspace_prefix) do
+  defp validate_root_separation(_root, nil), do: :ok
+
+  defp validate_root_separation(root, workspace) do
+    if path_contains?(root, workspace) or path_contains?(workspace, root) do
       {:error, :github_attempt_high_water_inside_workspace}
     else
       :ok
+    end
+  end
+
+  defp path_contains?(parent, child) do
+    Path.dirname(parent) == parent or parent == child or
+      String.starts_with?(child <> "/", parent <> "/")
+  end
+
+  defp reject_symlink_components(path) do
+    path
+    |> Path.expand()
+    |> Path.split()
+    |> Enum.reduce_while(nil, fn segment, current ->
+      candidate = if is_nil(current), do: segment, else: Path.join(current, segment)
+
+      case File.lstat(candidate) do
+        {:ok, %File.Stat{type: :symlink}} ->
+          {:halt, {:error, :github_attempt_high_water_symlink}}
+
+        {:ok, _stat} ->
+          {:cont, candidate}
+
+        {:error, :enoent} ->
+          {:halt, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, {:github_attempt_high_water_lstat, reason}}}
+      end
+    end)
+    |> case do
+      path when is_binary(path) -> :ok
+      result -> result
+    end
+  end
+
+  defp validate_secure_directory(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory, mode: mode}} when band(mode, 0o077) == 0 -> :ok
+      {:ok, _stat} -> {:error, :github_attempt_high_water_root_insecure}
+      {:error, reason} -> {:error, {:github_attempt_high_water_root_lstat, reason}}
     end
   end
 
@@ -1100,6 +1326,12 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
           "#{settings.repository_id}-#{issue_id}.json"
         )
 
+      quarantine_path =
+        Path.join(
+          settings.high_water_root,
+          "#{settings.repository_id}-#{issue_id}.quarantine.json"
+        )
+
       {:ok,
        %{
          enabled: settings.enabled,
@@ -1113,14 +1345,15 @@ defmodule SymphonyElixir.GitHub.AttemptLedger do
          activation_label: settings.activation_label,
          source_revision: settings.source_revision,
          high_water_path: high_water_path,
+         quarantine_path: quarantine_path,
          max_attempts: max_attempts
        }}
     end
   end
 
   defp evidence_max(evidence) do
-    value = evidence_value(evidence, :max, "max", Config.settings!().agent.max_attempts)
-    if positive_integer?(value), do: value, else: 1
+    value = evidence_value(evidence, :max, "max", nil)
+    if positive_integer?(value), do: {:ok, value}, else: {:error, :github_attempt_evidence_max}
   end
 
   defp evidence_value(evidence, atom_key, string_key, default) do

@@ -69,7 +69,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
 
     # A process restart loses all in-memory orchestrator state. The durable
     # comments and host high-water file still deny a sixth reservation.
-    assert {:exhausted, %{used: 5}} = reserve(context, request_fun)
+    assert {:error, :github_attempt_quarantined} = reserve(context, request_fun)
   end
 
   test "disposable no-credential and no-Codex rehearsal stops after five starts across restart", context do
@@ -141,6 +141,52 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert length(Agent.get(context.state, & &1.comments)) == 1
   end
 
+  test "a failed confirmation read consumes no second reservation on recovery", context do
+    base_request = request_fun(context.state)
+    {:ok, phase} = Agent.start_link(fn -> :before_post end)
+
+    request = fn method, path, params, body, settings ->
+      case {method, Agent.get(phase, & &1)} do
+        {"POST", _} ->
+          result = base_request.(method, path, params, body, settings)
+          Agent.update(phase, fn _ -> :after_post end)
+          result
+
+        {"GET", :after_post} when path == "/repos/octo/repo/issues/42/comments" ->
+          {:error, :timeout}
+
+        _ ->
+          base_request.(method, path, params, body, settings)
+      end
+    end
+
+    assert {:error, {:github_attempt_comments_request, :timeout}} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
+    assert {:ok, %{used: 1}} = reserve(context, base_request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
+  end
+
+  test "a confirmed reservation fails closed if the final high-water target becomes a symlink", context do
+    base_request = request_fun(context.state)
+    injected = Path.join(context.workspace_root, "injected-high-water.json")
+
+    request = fn method, path, params, body, settings ->
+      result = base_request.(method, path, params, body, settings)
+
+      if method == "POST" and String.starts_with?(body["body"], attempt_marker()) do
+        [high_water_path] = Path.wildcard(Path.join(context.high_water_root, "*.json"))
+        File.write!(injected, File.read!(high_water_path))
+        File.rm!(high_water_path)
+        File.ln_s!(injected, high_water_path)
+      end
+
+      result
+    end
+
+    assert {:error, :github_attempt_high_water_target} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
+  end
+
   test "malformed or edited trusted ledger comments fail closed", context do
     malformed = trusted_comment(1_000, attempt_marker() <> "{}")
     Agent.update(context.state, &%{&1 | comments: [malformed], next_id: 1_001})
@@ -162,7 +208,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
       %{state | comments: [edited]}
     end)
 
-    assert {:error, :github_attempt_comment_edited} =
+    assert {:error, :github_attempt_quarantined} =
              reserve(context, request_fun(context.state))
   end
 
@@ -175,6 +221,20 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
 
     assert {:ok, %{used: 1}} = reserve(context, request_fun(context.state))
     assert length(Agent.get(context.state, & &1.comments)) == 2
+  end
+
+  test "wrong bot type or GitHub App id cannot consume the budget", context do
+    wrong_type =
+      trusted_comment(1_000, attempt_marker() <> "{}")
+      |> put_in(["user", "type"], "User")
+
+    wrong_app =
+      trusted_comment(1_001, attempt_marker() <> "{}")
+      |> put_in(["performed_via_github_app", "id"], 100)
+
+    Agent.update(context.state, &%{&1 | comments: [wrong_type, wrong_app], next_id: 1_002})
+
+    assert {:ok, %{used: 1}} = reserve(context, request_fun(context.state))
   end
 
   test "deleted middle or tail entries are rejected by chain and high-water evidence", context do
@@ -190,13 +250,49 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     assert {:error, :github_attempt_ledger_regressed} = reserve(context, request_fun)
   end
 
+  test "deleting the complete remote ledger cannot reset a durable budget", context do
+    request = request_fun(context.state)
+    assert {:ok, %{used: 1}} = reserve(context, request)
+    Agent.update(context.state, &%{&1 | comments: []})
+    assert {:error, :github_attempt_ledger_regressed} = reserve(context, request)
+  end
+
+  test "a duplicated reservation id across a page boundary is rejected", context do
+    request = request_fun(context.state)
+    assert {:ok, %{used: 1}} = reserve(context, request)
+    assert {:ok, %{used: 2}} = reserve(context, request)
+    [first, second] = Agent.get(context.state, & &1.comments)
+    first_data = decode_marker_body(first["body"], attempt_marker())
+    second_data = decode_marker_body(second["body"], attempt_marker())
+
+    forged_second =
+      trusted_comment(
+        second["id"],
+        attempt_marker() <>
+          canonical_json(Map.put(second_data, "reservation_id", first_data["reservation_id"]))
+      )
+
+    ordinary =
+      Enum.map(1..99, fn id ->
+        %{
+          "id" => id,
+          "body" => "ordinary comment #{id}",
+          "created_at" => "2026-01-01T00:00:00Z",
+          "updated_at" => "2026-01-01T00:00:00Z"
+        }
+      end)
+
+    Agent.update(context.state, &%{&1 | comments: ordinary ++ [first, forged_second]})
+    assert {:error, :github_attempt_duplicate_reservation} = reserve(context, request)
+  end
+
   test "high-water write failure happens before any GitHub reservation", context do
     blocked_root = Path.join(context.root, "not-a-directory")
     File.write!(blocked_root, "file")
 
     tracker_settings = tracker_settings(blocked_root)
 
-    assert {:error, {:github_attempt_high_water_read, :enotdir}} =
+    assert {:error, :enotdir} =
              AttemptLedger.reserve_for_test(
                context.issue,
                5,
@@ -206,6 +302,116 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
              )
 
     assert Agent.get(context.state, & &1.comments) == []
+  end
+
+  test "a symlinked host-state root resolving inside the workspace is rejected", context do
+    target = Path.join(context.workspace_root, "agent-controlled-state")
+    File.mkdir_p!(target)
+    File.ln_s!(target, context.high_water_root)
+
+    assert {:error, :github_attempt_high_water_inside_workspace} =
+             reserve(context, request_fun(context.state))
+
+    assert Agent.get(context.state, & &1.comments) == []
+  end
+
+  test "a symlinked high-water file is rejected before it can authorize a start", context do
+    request = request_fun(context.state)
+    assert {:ok, %{used: 1}} = reserve(context, request)
+
+    [high_water_path] = Path.wildcard(Path.join(context.high_water_root, "*.json"))
+    injected = Path.join(context.workspace_root, "injected.json")
+    File.write!(injected, File.read!(high_water_path))
+    File.rm!(high_water_path)
+    File.ln_s!(injected, high_water_path)
+
+    assert {:error, :github_attempt_high_water_malformed} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.comments)) == 1
+  end
+
+  test "GitHub read failure is explicit and fail closed", context do
+    unavailable = fn _method, _path, _params, _body, _settings -> {:error, :econnrefused} end
+
+    assert {:error, {:github_attempt_comments_request, :econnrefused}} =
+             reserve(context, unavailable)
+  end
+
+  test "comment pagination succeeds across a full page and fails at the hard limit", context do
+    ordinary = fn id ->
+      %{
+        "id" => id,
+        "body" => "ordinary comment #{id}",
+        "created_at" => "2026-01-01T00:00:00Z",
+        "updated_at" => "2026-01-01T00:00:00Z"
+      }
+    end
+
+    Agent.update(context.state, fn state ->
+      %{state | comments: Enum.map(1..100, &ordinary.(&1)), next_id: 1_000}
+    end)
+
+    assert {:ok, %{used: 1}} = reserve(context, request_fun(context.state))
+
+    other_root = Path.join(context.root, "page-limit-state")
+    settings = tracker_settings(other_root)
+
+    Agent.update(context.state, fn state ->
+      %{state | comments: Enum.map(1..1_000, &ordinary.(&1)), next_id: 2_000}
+    end)
+
+    assert {:error, :github_attempt_comments_page_limit} =
+             AttemptLedger.reserve_for_test(
+               context.issue,
+               5,
+               settings,
+               request_fun(context.state),
+               workspace_root: context.workspace_root
+             )
+  end
+
+  test "deactivation quarantine survives remote failure and prevents a restart launch", context do
+    Agent.update(context.state, &%{&1 | delete_mode: :error})
+    request = request_fun(context.state)
+
+    assert {:error, {:attempt_deactivation_failed, _, _, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "reservation_failed"},
+               context.tracker_settings,
+               request,
+               workspace_root: context.workspace_root
+             )
+
+    first_call_count = length(Agent.get(context.state, & &1.calls))
+    assert {:error, :github_attempt_quarantined} = reserve(context, request)
+    assert length(Agent.get(context.state, & &1.calls)) == first_call_count
+
+    assert {:error, {:attempt_deactivation_failed, _, _, _}} =
+             AttemptLedger.deactivate_for_test(
+               context.issue,
+               %{max: 5, reason: "different_reason"},
+               context.tracker_settings,
+               request,
+               workspace_root: context.workspace_root
+             )
+
+    comments = Agent.get(context.state, & &1.comments)
+    assert Enum.count(comments, &String.starts_with?(&1["body"], exhaustion_marker())) == 1
+
+    calls = Agent.get(context.state, &Enum.reverse(&1.calls))
+
+    exhaustion_post =
+      Enum.find_index(calls, fn {method, path, _, _} ->
+        method == "POST" and String.ends_with?(path, "/comments")
+      end)
+
+    label_delete =
+      Enum.find_index(calls, fn {method, path, _, _} ->
+        method == "DELETE" and String.contains?(path, "/labels/")
+      end)
+
+    assert is_integer(exhaustion_post) and is_integer(label_delete)
+    assert exhaustion_post < label_delete
   end
 
   test "an oversized comment page fails closed", context do
@@ -228,6 +434,15 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
                  context.tracker_settings,
                  [:provider, "attempt_ledger", "actor_id"],
                  nil
+               )
+             )
+
+    assert {:error, :github_attempt_ledger_requires_official_api} =
+             AttemptLedger.validate_settings(
+               put_in(
+                 context.tracker_settings,
+                 [:provider, "api_url"],
+                 "https://github.example/api/v3"
                )
              )
   end
@@ -273,7 +488,8 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
     do: %{state | calls: [{method, path, params, body} | state.calls]}
 
   defp handle_request("GET", "/repos/octo/repo/issues/42/comments", params, _body, state) do
-    comments = if params["page"] == 1, do: state.comments, else: []
+    page = params["page"] || 1
+    comments = Enum.slice(state.comments, (page - 1) * 100, 100)
     {{:ok, %{status: 200, body: comments}}, state}
   end
 
@@ -283,8 +499,14 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
   end
 
   defp handle_request("DELETE", "/repos/octo/repo/issues/42/labels/pilot%3Asymphony", _params, _body, state) do
-    response = {:ok, %{status: 204, body: nil}}
-    {response, %{state | labels: state.labels -- ["pilot:symphony"]}}
+    case state.delete_mode do
+      :normal ->
+        response = {:ok, %{status: 204, body: nil}}
+        {response, %{state | labels: state.labels -- ["pilot:symphony"]}}
+
+      :error ->
+        {{:error, :timeout}, state}
+    end
   end
 
   defp handle_request("GET", "/repos/octo/repo/issues/42", _params, _body, state) do
@@ -316,6 +538,7 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
       labels: ["agent-ready", "pilot:symphony"],
       next_id: 1_000,
       post_mode: :normal,
+      delete_mode: :normal,
       calls: [],
       codex_calls: 0
     }
@@ -370,6 +593,17 @@ defmodule SymphonyElixir.GitHub.AttemptLedgerTest do
       "user" => %{"id" => @actor_id, "type" => "Bot"},
       "performed_via_github_app" => %{"id" => @app_id}
     }
+  end
+
+  defp decode_marker_body(body, marker) do
+    body |> String.replace_prefix(marker, "") |> Jason.decode!()
+  end
+
+  defp canonical_json(data) do
+    data
+    |> Enum.sort_by(fn {key, _value} -> key end)
+    |> Enum.map_join(",", fn {key, value} -> Jason.encode!(key) <> ":" <> Jason.encode!(value) end)
+    |> then(&("{" <> &1 <> "}"))
   end
 
   defp read_high_water!(root) do

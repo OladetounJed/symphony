@@ -35,6 +35,10 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
 
+The ìwé downstream attempt-fuse is stricter: ledger/exhaustion blocks also write a host-local
+quarantine before remote deactivation. That quarantine survives runtime restart and is never
+cleared automatically.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -170,7 +174,13 @@ Notes:
   failure, stall, and spawn-failure recovery. It requires `agent.instance_lock_port` and a configured
   `tracker.provider.attempt_ledger`; missing or invalid durable evidence fails closed.
 - `agent.instance_lock_port` is a host-local singleton fence, not multi-host coordination. The
-  downstream pilot supports one service instance on one host only.
+  downstream pilot supports one service instance on one host only. It owns a frozen copy of the
+  complete fuse profile outside the inner task/orchestrator restart domain; any fuse-setting reload
+  drift denies dispatch until a full reviewed service restart.
+- The host-state root is canonicalized, restricted to owner access, and must be disjoint from the
+  canonical workspace root. Symlinked host-state components or files fail closed.
+- Reservation five may run. Its exit triggers durable quarantine, one exhaustion evidence record,
+  activation-label removal, and confirmation without a sixth reservation.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

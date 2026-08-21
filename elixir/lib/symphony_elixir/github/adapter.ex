@@ -48,16 +48,16 @@ defmodule SymphonyElixir.GitHub.Adapter do
   def execute_agent_tool(tool, arguments, opts), do: AgentTool.execute(tool, arguments, opts)
 
   @impl true
-  @spec reserve_attempt(Issue.t(), pos_integer()) ::
+  @spec reserve_attempt(Issue.t(), pos_integer(), map()) ::
           {:ok, map()} | {:exhausted, map()} | {:error, term()}
-  def reserve_attempt(%Issue{} = issue, max_attempts) do
-    attempt_ledger_module().reserve(issue, max_attempts)
+  def reserve_attempt(%Issue{} = issue, max_attempts, attempt_fuse) do
+    attempt_ledger_module().reserve(issue, max_attempts, attempt_fuse)
   end
 
   @impl true
-  @spec deactivate_attempts(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
-  def deactivate_attempts(%Issue{} = issue, evidence) do
-    attempt_ledger_module().deactivate(issue, evidence)
+  @spec deactivate_attempts(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def deactivate_attempts(%Issue{} = issue, evidence, attempt_fuse) do
+    attempt_ledger_module().deactivate(issue, evidence, attempt_fuse)
   end
 
   @impl true

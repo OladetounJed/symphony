@@ -76,7 +76,7 @@ defmodule SymphonyElixirWeb.Presenter do
       attempts: %{
         restart_count: restart_count(retry),
         current_retry_attempt: retry_attempt(retry),
-        durable: durable_attempt_usage(running, blocked)
+        durable: durable_attempt_usage(running, retry, blocked)
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
@@ -97,8 +97,8 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp durable_attempt_usage(running, blocked) do
-    Map.get(running || blocked || %{}, :attempt_usage)
+  defp durable_attempt_usage(running, retry, blocked) do
+    Map.get(running || retry || blocked || %{}, :attempt_usage)
   end
 
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"

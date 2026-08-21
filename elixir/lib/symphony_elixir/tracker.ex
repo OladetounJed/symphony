@@ -25,14 +25,14 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
-  @callback reserve_attempt(Issue.t(), pos_integer()) ::
+  @callback reserve_attempt(Issue.t(), pos_integer(), map()) ::
               {:ok, map()} | {:exhausted, map()} | {:error, term()}
-  @callback deactivate_attempts(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  @callback deactivate_attempts(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
-                      reserve_attempt: 2,
-                      deactivate_attempts: 2,
+                      reserve_attempt: 3,
+                      deactivate_attempts: 3,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -88,25 +88,26 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  @spec reserve_attempt(Issue.t(), pos_integer()) ::
+  @spec reserve_attempt(Issue.t(), pos_integer(), map()) ::
           {:ok, map()} | {:exhausted, map()} | {:error, term()}
-  def reserve_attempt(%Issue{} = issue, max_attempts)
-      when is_integer(max_attempts) and max_attempts > 0 do
-    adapter = adapter()
+  def reserve_attempt(%Issue{} = issue, max_attempts, %{tracker_settings: tracker_settings} = attempt_fuse)
+      when is_integer(max_attempts) and max_attempts > 0 and is_map(tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :reserve_attempt, 2) do
-      adapter.reserve_attempt(issue, max_attempts)
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :reserve_attempt, 3) do
+      adapter.reserve_attempt(issue, max_attempts, attempt_fuse)
     else
       {:error, :attempt_ledger_unsupported}
     end
   end
 
-  @spec deactivate_attempts(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
-  def deactivate_attempts(%Issue{} = issue, evidence) when is_map(evidence) do
-    adapter = adapter()
+  @spec deactivate_attempts(Issue.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def deactivate_attempts(%Issue{} = issue, evidence, %{tracker_settings: tracker_settings} = attempt_fuse)
+      when is_map(evidence) and is_map(tracker_settings) do
+    adapter = adapter_for_settings!(tracker_settings)
 
-    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :deactivate_attempts, 2) do
-      adapter.deactivate_attempts(issue, evidence)
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :deactivate_attempts, 3) do
+      adapter.deactivate_attempts(issue, evidence, attempt_fuse)
     else
       {:error, :attempt_deactivation_unsupported}
     end

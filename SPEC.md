@@ -457,6 +457,8 @@ Fields:
     continuation, failure, stall, and spawn-failure recovery.
   - A durable provider reservation MUST be confirmed before process launch.
   - Exhausted, unavailable, malformed, conflicting, or unconfirmed evidence MUST start no worker.
+  - The complete enabled attempt-fuse profile is immutable for the singleton runtime lifetime.
+    Reload drift MUST fail closed before dispatch and requires a full service restart.
 - `instance_lock_port` (optional positive integer; downstream extension)
   - Required with `max_attempts` by the ìwé GitHub profile.
   - Holds a loopback socket for the agent runtime lifetime so a second service on the same host
@@ -577,6 +579,9 @@ Dynamic reload is REQUIRED:
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
+- A configured downstream attempt fuse is an explicit exception: its budget, singleton port,
+  tracker/repository identity, source revision, host-state root, workspace root, and agent-tool
+  boundary remain frozen for that singleton lifetime. Any change fails closed until full restart.
 - Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
   changes.
 - Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
@@ -1713,6 +1718,9 @@ After restart:
   - startup terminal workspace cleanup
   - fresh polling of active issues
   - re-dispatching eligible work
+- The downstream GitHub attempt ledger additionally recovers its remote reservation chain,
+  host-local high-water state, and durable quarantine. A quarantined issue is not eligible after
+  restart even if its activation label still exists because remote deactivation previously failed.
 
 ### 14.4 Operator Intervention Points
 

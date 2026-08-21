@@ -8,17 +8,26 @@ defmodule SymphonyElixir.InstanceLock do
 
   use GenServer
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{AttemptFuse, Config}
 
   @loopback {127, 0, 0, 1}
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
   def start_link(opts \\ []) do
-    port = Keyword.get_lazy(opts, :port, fn -> Config.settings!().agent.instance_lock_port end)
+    attempt_fuse =
+      Keyword.get_lazy(opts, :attempt_fuse, fn ->
+        Config.settings!() |> AttemptFuse.snapshot()
+      end)
+
+    port = Keyword.get(opts, :port, attempt_fuse.instance_lock_port)
 
     case port do
       value when is_integer(value) and value > 0 and value < 65_536 ->
-        GenServer.start_link(__MODULE__, value, name: Keyword.get(opts, :name, __MODULE__))
+        GenServer.start_link(
+          __MODULE__,
+          {value, attempt_fuse},
+          name: Keyword.get(opts, :name, __MODULE__)
+        )
 
       nil ->
         :ignore
@@ -28,8 +37,11 @@ defmodule SymphonyElixir.InstanceLock do
     end
   end
 
+  @spec attempt_fuse(GenServer.server()) :: AttemptFuse.snapshot()
+  def attempt_fuse(server \\ __MODULE__), do: GenServer.call(server, :attempt_fuse)
+
   @impl true
-  def init(port) do
+  def init({port, attempt_fuse}) do
     options = [
       :binary,
       active: false,
@@ -39,10 +51,13 @@ defmodule SymphonyElixir.InstanceLock do
     ]
 
     case :gen_tcp.listen(port, options) do
-      {:ok, socket} -> {:ok, %{port: port, socket: socket}}
+      {:ok, socket} -> {:ok, %{port: port, socket: socket, attempt_fuse: attempt_fuse}}
       {:error, reason} -> {:stop, {:instance_lock_unavailable, port, reason}}
     end
   end
+
+  @impl true
+  def handle_call(:attempt_fuse, _from, state), do: {:reply, state.attempt_fuse, state}
 
   @impl true
   def terminate(_reason, %{socket: socket}) do

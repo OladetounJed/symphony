@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, AttemptFuse, Config, InstanceLock, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -33,8 +33,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
-      :instance_lock_port,
-      :max_attempts,
+      :attempt_fuse,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -67,8 +66,7 @@ defmodule SymphonyElixir.Orchestrator do
           poll_check_in_progress: false,
           tick_timer_ref: nil,
           tick_token: nil,
-          instance_lock_port: config.agent.instance_lock_port,
-          max_attempts: config.agent.max_attempts,
+          attempt_fuse: attempt_fuse_snapshot(opts, config),
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -211,30 +209,54 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      attempt_budget_exhausted?(running_entry) ->
+        block_attempt_dispatch(
+          state,
+          running_entry.issue,
+          {:max_attempts_exhausted_after_worker, :normal},
+          running_entry.attempt_usage
+        )
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          attempt_usage: Map.get(running_entry, :attempt_usage)
+        })
     end
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    cond do
+      attempt_budget_exhausted?(running_entry) ->
+        block_attempt_dispatch(
+          state,
+          running_entry.issue,
+          {:max_attempts_exhausted_after_worker, reason},
+          running_entry.attempt_usage
+        )
+
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+
+      true ->
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
+
+  defp attempt_budget_exhausted?(%{attempt_usage: %{exhausted: true}}), do: true
+  defp attempt_budget_exhausted?(_running_entry), do: false
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -254,7 +276,8 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      attempt_usage: Map.get(running_entry, :attempt_usage)
     })
   end
 
@@ -956,7 +979,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case reserve_worker_start(issue) do
+    case reserve_worker_start(issue, state.attempt_fuse) do
       {:ok, attempt_evidence} ->
         start_reserved_worker(
           state,
@@ -976,24 +999,16 @@ defmodule SymphonyElixir.Orchestrator do
         )
 
       {:error, reason} ->
-        block_attempt_dispatch(state, issue, {:attempt_reservation_failed, reason}, %{
-          used: nil,
-          max: Config.settings!().agent.max_attempts,
-          remaining: nil,
-          exhausted: false,
-          reservation_id: nil,
-          evidence_url: nil,
-          tip_comment_id: nil,
-          tip_digest: nil,
-          observed_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-        })
+        block_attempt_dispatch(state, issue, {:attempt_reservation_failed, reason}, nil)
     end
   end
 
-  defp reserve_worker_start(issue) do
-    case Config.settings!().agent.max_attempts do
-      nil -> {:ok, nil}
-      max_attempts -> Tracker.reserve_attempt(issue, max_attempts)
+  defp reserve_worker_start(issue, attempt_fuse) do
+    with :ok <- AttemptFuse.validate_current(attempt_fuse) do
+      case attempt_fuse.max_attempts do
+        nil -> {:ok, nil}
+        max_attempts -> Tracker.reserve_attempt(issue, max_attempts, attempt_fuse)
+      end
     end
   end
 
@@ -1011,8 +1026,17 @@ defmodule SymphonyElixir.Orchestrator do
         _ -> retry_attempt
       end
 
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient,
+    state = %{
+      state
+      | attempt_usage: put_attempt_usage(state.attempt_usage, issue.id, attempt_evidence)
+    }
+
+    runner = agent_runner_module()
+
+    task_starter = task_starter_module()
+
+    case task_starter.start_child(state.task_supervisor, fn ->
+           runner.run(issue, recipient,
              attempt: prompt_attempt,
              worker_host: worker_host
            )
@@ -1065,18 +1089,24 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          attempt_usage: attempt_evidence
         })
     end
   end
 
   defp block_attempt_dispatch(%State{} = state, issue, reason, attempt_evidence) do
     deactivation_evidence =
-      attempt_evidence
+      (attempt_evidence || %{})
       |> Map.put(:reason, inspect(reason))
-      |> Map.put_new(:max, Config.settings!().agent.max_attempts)
+      |> Map.put_new(:max, state.attempt_fuse.max_attempts || 1)
 
-    deactivation = Tracker.deactivate_attempts(issue, deactivation_evidence)
+    deactivation =
+      Tracker.deactivate_attempts(
+        issue,
+        deactivation_evidence,
+        state.attempt_fuse
+      )
 
     blocked_entry = %{
       issue_id: issue.id,
@@ -1153,6 +1183,13 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
+    attempt_usage =
+      Map.get(
+        metadata,
+        :attempt_usage,
+        Map.get(previous_retry, :attempt_usage, Map.get(state.attempt_usage, issue_id))
+      )
+
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
     end
@@ -1175,7 +1212,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            attempt_usage: attempt_usage
           })
     }
   end
@@ -1188,7 +1226,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          attempt_usage: Map.get(retry_entry, :attempt_usage)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1555,7 +1594,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          attempt_usage: Map.get(retry, :attempt_usage)
         }
       end)
 
@@ -1743,16 +1783,28 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
 
-    if state.instance_lock_port != config.agent.instance_lock_port or
-         state.max_attempts != config.agent.max_attempts do
-      raise "agent attempt-fuse settings changed; restarting the one-for-all runtime is required"
-    end
-
     %{
       state
       | poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
+  end
+
+  defp attempt_fuse_snapshot(opts, config) do
+    lock_name = Keyword.get(opts, :instance_lock_name, InstanceLock)
+
+    case Process.whereis(lock_name) do
+      pid when is_pid(pid) -> InstanceLock.attempt_fuse(lock_name)
+      _ -> AttemptFuse.snapshot(config)
+    end
+  end
+
+  defp agent_runner_module do
+    Application.get_env(:symphony_elixir, :agent_runner_module, AgentRunner)
+  end
+
+  defp task_starter_module do
+    Application.get_env(:symphony_elixir, :task_starter_module, Task.Supervisor)
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do

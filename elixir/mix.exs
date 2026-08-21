@@ -10,41 +10,9 @@ defmodule SymphonyElixir.MixProject do
       start_permanent: Mix.env() == :prod,
       test_coverage: [
         summary: [
-          threshold: 100
+          threshold: coverage_threshold()
         ],
-        ignore_modules: [
-          SymphonyElixir.Asana.Client,
-          SymphonyElixir.Config,
-          SymphonyElixir.GitHub.AttemptLedger,
-          SymphonyElixir.GitHub.Client,
-          SymphonyElixir.GitLab.Client,
-          SymphonyElixir.Jira.Client,
-          SymphonyElixir.Linear.Client,
-          SymphonyElixir.SpecsCheck,
-          SymphonyElixir.Orchestrator,
-          SymphonyElixir.Orchestrator.State,
-          SymphonyElixir.AgentRunner,
-          SymphonyElixir.Application,
-          SymphonyElixir.CLI,
-          SymphonyElixir.Codex.AppServer,
-          SymphonyElixir.Codex.DynamicTool,
-          SymphonyElixir.HttpServer,
-          SymphonyElixir.InstanceLock,
-          SymphonyElixir.StatusDashboard,
-          SymphonyElixir.LogFile,
-          SymphonyElixir.Workspace,
-          SymphonyElixirWeb.DashboardLive,
-          SymphonyElixirWeb.Endpoint,
-          SymphonyElixirWeb.ErrorHTML,
-          SymphonyElixirWeb.ErrorJSON,
-          SymphonyElixirWeb.Layouts,
-          SymphonyElixirWeb.ObservabilityApiController,
-          SymphonyElixirWeb.Presenter,
-          SymphonyElixirWeb.StaticAssetController,
-          SymphonyElixirWeb.StaticAssets,
-          SymphonyElixirWeb.Router,
-          SymphonyElixirWeb.Router.Helpers
-        ]
+        ignore_modules: coverage_ignore_modules()
       ],
       test_ignore_filters: [
         "test/support/snapshot_support.exs",
@@ -59,6 +27,52 @@ defmodule SymphonyElixir.MixProject do
       deps: deps()
     ]
   end
+
+  defp coverage_threshold do
+    if attempt_fuse_coverage?(), do: 0, else: 100
+  end
+
+  defp coverage_ignore_modules do
+    modules = [
+      SymphonyElixir.Asana.Client,
+      SymphonyElixir.Config,
+      SymphonyElixir.GitHub.Client,
+      SymphonyElixir.GitLab.Client,
+      SymphonyElixir.Jira.Client,
+      SymphonyElixir.Linear.Client,
+      SymphonyElixir.SpecsCheck,
+      SymphonyElixir.Orchestrator,
+      SymphonyElixir.Orchestrator.State,
+      SymphonyElixir.AgentRunner,
+      SymphonyElixir.Application,
+      SymphonyElixir.CLI,
+      SymphonyElixir.Codex.AppServer,
+      SymphonyElixir.Codex.DynamicTool,
+      SymphonyElixir.HttpServer,
+      SymphonyElixir.StatusDashboard,
+      SymphonyElixir.LogFile,
+      SymphonyElixir.Workspace,
+      SymphonyElixirWeb.DashboardLive,
+      SymphonyElixirWeb.Endpoint,
+      SymphonyElixirWeb.ErrorHTML,
+      SymphonyElixirWeb.ErrorJSON,
+      SymphonyElixirWeb.Layouts,
+      SymphonyElixirWeb.ObservabilityApiController,
+      SymphonyElixirWeb.Presenter,
+      SymphonyElixirWeb.StaticAssetController,
+      SymphonyElixirWeb.StaticAssets,
+      SymphonyElixirWeb.Router,
+      SymphonyElixirWeb.Router.Helpers
+    ]
+
+    if attempt_fuse_coverage?() do
+      modules
+    else
+      [SymphonyElixir.GitHub.AttemptLedger | modules]
+    end
+  end
+
+  defp attempt_fuse_coverage?, do: System.get_env("SYMPHONY_ATTEMPT_FUSE_COVERAGE") == "1"
 
   # Run "mix help compile.app" to learn about applications.
   def application do
