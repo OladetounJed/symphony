@@ -245,7 +245,8 @@ defmodule SymphonyElixir.Orchestrator do
           state,
           running_entry.issue,
           {:max_attempts_exhausted_after_worker, :normal},
-          running_entry.attempt_usage
+          running_entry.attempt_usage,
+          running_entry
         )
 
       input_required_blocker?(running_entry) ->
@@ -276,7 +277,8 @@ defmodule SymphonyElixir.Orchestrator do
           state,
           running_entry.issue,
           {:max_attempts_exhausted_after_worker, reason},
-          running_entry.attempt_usage
+          running_entry.attempt_usage,
+          running_entry
         )
 
       input_required_blocker?(running_entry) ->
@@ -712,7 +714,8 @@ defmodule SymphonyElixir.Orchestrator do
           |> block_attempt_dispatch(
             running_entry.issue,
             {:max_attempts_exhausted_during_stall, attempt_evidence},
-            attempt_evidence
+            attempt_evidence,
+            running_entry
           )
 
         input_required_blocker?(running_entry) ->
@@ -1312,6 +1315,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp worker_tracker_settings(_attempt_fuse), do: Config.settings!().tracker
 
   defp block_attempt_dispatch(%State{} = state, issue, reason, attempt_evidence) do
+    block_attempt_dispatch(state, issue, reason, attempt_evidence, %{})
+  end
+
+  defp block_attempt_dispatch(
+         %State{} = state,
+         issue,
+         reason,
+         attempt_evidence,
+         runtime_entry
+       ) do
     deactivation_evidence =
       (attempt_evidence || %{})
       |> Map.put(:reason, inspect(reason))
@@ -1328,8 +1341,10 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: issue.id,
       identifier: issue.identifier,
       issue: issue,
-      worker_host: nil,
-      workspace_path: nil,
+      worker_host: Map.get(runtime_entry, :worker_host),
+      workspace_path: Map.get(runtime_entry, :workspace_path),
+      workspace_root: Map.get(runtime_entry, :workspace_root),
+      workspace_hooks: Map.get(runtime_entry, :workspace_hooks),
       session_id: nil,
       error: {reason, deactivation},
       blocked_at: DateTime.utc_now(),

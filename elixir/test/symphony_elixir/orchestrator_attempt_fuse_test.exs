@@ -305,6 +305,15 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
   defmodule FifthBoundaryRunner do
     def run(issue, recipient, opts) do
       attempt = Keyword.fetch!(opts, :attempt)
+
+      case Application.get_env(:symphony_elixir, :fifth_boundary_runtime_info) do
+        runtime_info when is_map(runtime_info) ->
+          send(recipient, {:worker_runtime_info, issue.id, runtime_info})
+
+        _ ->
+          :ok
+      end
+
       send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {:worker_started, attempt})
 
       case {attempt, Application.fetch_env!(:symphony_elixir, :fifth_boundary_mode)} do
@@ -1323,6 +1332,51 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     run_fifth_boundary_scenario(:spawn_failure)
   end
 
+  test "a fifth-worker block keeps frozen cleanup authority through terminal reconciliation" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-fifth-cleanup-authority-#{suffix}")
+    old_root = Path.join(root, "workspaces")
+    new_root = Path.join(root, "new-workspaces")
+    old_workspace = Path.join(old_root, "GH-42")
+    new_workspace = Path.join(new_root, "GH-42")
+    old_marker = Path.join(root, "old-hook-ran")
+    new_marker = Path.join(root, "new-hook-ran")
+
+    File.mkdir_p!(old_workspace)
+    File.mkdir_p!(new_workspace)
+
+    result =
+      run_fifth_boundary_scenario(:normal_exit,
+        root: root,
+        hook_before_remove: "printf old > \"#{old_marker}\"",
+        record_workspace: true
+      )
+
+    assert %{
+             workspace_path: ^old_workspace,
+             workspace_root: ^old_root,
+             workspace_hooks: %{before_remove: before_remove}
+           } = result.state.blocked[result.issue.id]
+
+    assert before_remove =~ old_marker
+
+    GenServer.stop(result.runtime_pid)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: new_root,
+      hook_before_remove: "printf new > \"#{new_marker}\""
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+    closed_issue = %{result.issue | state: "closed", labels: [], dispatchable: false}
+    _state = Orchestrator.reconcile_blocked_issue_states_for_test([closed_issue], result.state)
+
+    refute File.exists?(old_workspace)
+    assert File.exists?(new_workspace)
+    assert File.read!(old_marker) == "old"
+    refute File.exists?(new_marker)
+  end
+
   test "a queued retry fails closed when any frozen fuse setting reloads" do
     suffix = System.unique_integer([:positive])
     root = Path.join(canonical_tmp_dir(), "symphony-attempt-reload-#{suffix}")
@@ -1413,6 +1467,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     stall_timeout_ms = Keyword.get(opts, :stall_timeout_ms, 300_000)
     max_turns = Keyword.get(opts, :max_turns, 24)
     worker_hosts = Keyword.get(opts, :worker_hosts, [])
+    before_remove = Jason.encode!(Keyword.get(opts, :hook_before_remove))
     high_water_root = Path.join(root, "host-state")
     File.mkdir_p!(high_water_root)
     File.chmod!(high_water_root, 0o700)
@@ -1442,6 +1497,9 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
         interval_ms: 10
       workspace:
         root: "#{Path.join(root, "workspaces")}"
+      hooks:
+        before_remove: #{before_remove}
+        timeout_ms: 600000
       worker:
         ssh_hosts: #{inspect(worker_hosts)}
         max_concurrent_agents_per_host: 1
@@ -1598,9 +1656,14 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     end
   end
 
-  defp run_fifth_boundary_scenario(mode) do
+  defp run_fifth_boundary_scenario(mode, opts \\ []) do
     suffix = System.unique_integer([:positive])
-    root = Path.join(canonical_tmp_dir(), "symphony-fifth-boundary-#{mode}-#{suffix}")
+
+    root =
+      Keyword.get_lazy(opts, :root, fn ->
+        Path.join(canonical_tmp_dir(), "symphony-fifth-boundary-#{mode}-#{suffix}")
+      end)
+
     workflow_path = Workflow.workflow_file_path()
     runtime_name = Module.concat(__MODULE__, "FifthRuntime#{suffix}")
     orchestrator_name = Module.concat(__MODULE__, "FifthOrchestrator#{suffix}")
@@ -1638,6 +1701,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
             :attempt_fuse_test_pid,
             :attempt_fuse_remote,
             :fifth_boundary_mode,
+            :fifth_boundary_runtime_info,
             :attempt_fuse_task_starter_state,
             :task_starter_module
           ] do
@@ -1649,8 +1713,23 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
       File.rm_rf(root)
     end)
 
-    write_github_attempt_workflow!(workflow_path, root, available_port(), stall_timeout_ms: 1)
+    write_github_attempt_workflow!(workflow_path, root, available_port(),
+      stall_timeout_ms: 1,
+      hook_before_remove: Keyword.get(opts, :hook_before_remove)
+    )
+
     assert :ok = WorkflowStore.force_reload()
+
+    if Keyword.get(opts, :record_workspace, false) do
+      settings = Config.settings!()
+
+      Application.put_env(:symphony_elixir, :fifth_boundary_runtime_info, %{
+        worker_host: nil,
+        workspace_path: Path.join(settings.workspace.root, issue.identifier),
+        workspace_root: settings.workspace.root,
+        workspace_hooks: settings.hooks
+      })
+    end
 
     assert {:ok, runtime_pid} =
              SymphonyElixir.AgentRuntimeSupervisor.start_link(
@@ -1685,5 +1764,11 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     assert Enum.count(snapshot.comments, &String.starts_with?(&1["body"], @attempt_marker)) == 5
     assert Enum.count(snapshot.comments, &String.starts_with?(&1["body"], @exhaustion_marker)) == 1
     refute "pilot:symphony" in snapshot.labels
+
+    %{
+      issue: issue,
+      runtime_pid: runtime_pid,
+      state: :sys.get_state(orchestrator_name)
+    }
   end
 end
