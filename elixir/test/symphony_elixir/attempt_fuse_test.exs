@@ -178,7 +178,7 @@ defmodule SymphonyElixir.AttemptFuseTest do
     File.rm_rf(root)
   end
 
-  test "local workspace and App Server validators retain the frozen root across a broader live reload" do
+  test "production Workspace and App Server boundaries retain the frozen root across a broader live reload" do
     root =
       Path.join(
         System.tmp_dir!(),
@@ -187,33 +187,194 @@ defmodule SymphonyElixir.AttemptFuseTest do
 
     frozen_root = Path.join(root, "frozen-workspaces")
     outside = Path.join(root, "outside")
-    symlink_workspace = Path.join(frozen_root, "GH-42")
+    identifier = "GH-42"
+    symlink_workspace = Path.join(frozen_root, Workspace.workspace_key(identifier))
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
 
     File.mkdir_p!(frozen_root)
     File.mkdir_p!(outside)
     File.ln_s!(outside, symlink_workspace)
-    {:ok, canonical_outside} = SymphonyElixir.PathSafety.canonicalize(outside)
 
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+      Application.delete_env(:symphony_elixir, :app_server_workspace_boundary_observer)
+      File.rm_rf(root)
+    end)
+
+    write_attempt_workflow!(workflow_path, root, port, frozen_root)
     assert :ok = WorkflowStore.force_reload()
-    assert Config.local_workspace_root() == root
+    frozen = AttemptFuse.current_snapshot()
+    binding = Tracker.bind_agent_tools(frozen.tracker_settings)
 
-    assert :ok = Workspace.validate_workspace_path_for_test(symlink_workspace, root)
+    Application.put_env(
+      :symphony_elixir,
+      :workspace_boundary_observer,
+      fn
+        :before_path, _safe_id, nil ->
+          Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+          write_attempt_workflow!(workflow_path, root, port, root)
+          WorkflowStore.force_reload()
 
-    assert {:error, {:workspace_symlink_escape, ^symlink_workspace, _root}} =
-             Workspace.validate_workspace_path_for_test(symlink_workspace, frozen_root)
+        _stage, _value, _worker_host ->
+          :ok
+      end
+    )
 
-    assert {:ok, ^canonical_outside} =
-             AppServer.validate_workspace_cwd_for_test(symlink_workspace, root)
+    assert {:error, {:workspace_outside_root, _canonical_workspace, _canonical_root}} =
+             Workspace.create_for_issue(identifier, nil, frozen)
 
-    assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
-             AppServer.validate_workspace_cwd_for_test(symlink_workspace, frozen_root)
+    write_attempt_workflow!(workflow_path, root, port, frozen_root)
+    assert :ok = WorkflowStore.force_reload()
+    assert :ok = AttemptFuse.validate_current(frozen)
 
-    File.rm_rf(root)
+    Application.put_env(
+      :symphony_elixir,
+      :app_server_workspace_boundary_observer,
+      fn ^symlink_workspace, nil ->
+        Application.delete_env(:symphony_elixir, :app_server_workspace_boundary_observer)
+        write_attempt_workflow!(workflow_path, root, port, root)
+        WorkflowStore.force_reload()
+      end
+    )
+
+    assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _canonical_root}} =
+             AppServer.start_session(symlink_workspace,
+               attempt_fuse: frozen,
+               dynamic_tool_binding: binding
+             )
   end
 
-  defp write_attempt_workflow!(path, root, port, workspace_root \\ nil) do
+  test "post-create fuse drift removes a new local workspace so after_create retries" do
+    root = Path.join(System.tmp_dir!(), "symphony-fuse-local-cleanup-#{System.unique_integer([:positive])}")
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
+    hook = "printf ready > READY"
+    identifier = "GH-LOCAL-CLEANUP"
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+      File.rm_rf(root)
+    end)
+
+    write_attempt_workflow!(workflow_path, root, port, nil, hook_after_create: hook)
+    assert :ok = WorkflowStore.force_reload()
+    frozen = AttemptFuse.current_snapshot()
+
+    {:ok, workspace} =
+      SymphonyElixir.PathSafety.canonicalize(Path.join(frozen.workspace_root, Workspace.workspace_key(identifier)))
+
+    Application.put_env(
+      :symphony_elixir,
+      :workspace_boundary_observer,
+      fn
+        :prepared, _prepared_workspace, nil ->
+          Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+
+          write_attempt_workflow!(workflow_path, root, port, nil,
+            hook_after_create: hook,
+            source_revision: String.duplicate("b", 40)
+          )
+
+          WorkflowStore.force_reload()
+
+        _stage, _value, _worker_host ->
+          :ok
+      end
+    )
+
+    assert {:error, :attempt_fuse_config_drift} =
+             Workspace.create_for_issue(identifier, nil, frozen)
+
+    refute File.exists?(workspace)
+
+    write_attempt_workflow!(workflow_path, root, port, nil, hook_after_create: hook)
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, ^workspace} = Workspace.create_for_issue(identifier, nil, frozen)
+    assert File.read!(Path.join(workspace, "READY")) == "ready"
+  end
+
+  test "post-create fuse drift removes a new remote workspace so after_create retries" do
+    root = Path.join(System.tmp_dir!(), "symphony-fuse-remote-cleanup-#{System.unique_integer([:positive])}")
+    workflow_path = Workflow.workflow_file_path()
+    port = available_port()
+    trace = Path.join(root, "ssh.trace")
+    fake_ssh = Path.join(root, "ssh")
+    remote_root = "/remote/workspaces"
+    remote_workspace = Path.join(remote_root, "GH-REMOTE-CLEANUP")
+    hook = "echo remote-after-create"
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(root)
+    end)
+
+    File.mkdir_p!(root)
+    System.put_env("SYMP_TEST_SSH_TRACE", trace)
+    System.put_env("PATH", root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+    case "$*" in
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{remote_workspace}'
+        ;;
+    esac
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_attempt_workflow!(workflow_path, root, port, remote_root, hook_after_create: hook)
+
+    assert :ok = WorkflowStore.force_reload()
+    frozen = AttemptFuse.current_snapshot()
+
+    Application.put_env(
+      :symphony_elixir,
+      :workspace_boundary_observer,
+      fn
+        :prepared, ^remote_workspace, "worker-01" ->
+          Application.delete_env(:symphony_elixir, :workspace_boundary_observer)
+
+          write_attempt_workflow!(workflow_path, root, port, remote_root,
+            hook_after_create: hook,
+            source_revision: String.duplicate("b", 40)
+          )
+
+          WorkflowStore.force_reload()
+
+        _stage, _value, _worker_host ->
+          :ok
+      end
+    )
+
+    assert {:error, :attempt_fuse_config_drift} =
+             Workspace.create_for_issue("GH-REMOTE-CLEANUP", "worker-01", frozen)
+
+    first_trace = File.read!(trace)
+    assert first_trace =~ "rm -rf"
+    refute first_trace =~ hook
+
+    write_attempt_workflow!(workflow_path, root, port, remote_root, hook_after_create: hook)
+
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, ^remote_workspace} =
+             Workspace.create_for_issue("GH-REMOTE-CLEANUP", "worker-01", frozen)
+
+    assert File.read!(trace) =~ hook
+  end
+
+  defp write_attempt_workflow!(path, root, port, workspace_root \\ nil, opts \\ []) do
     workspace_root = workspace_root || Path.join(root, "workspaces")
+    source_revision = Keyword.get(opts, :source_revision, String.duplicate("a", 40))
+    after_create = Jason.encode!(Keyword.get(opts, :hook_after_create))
 
     File.write!(
       path,
@@ -231,7 +392,7 @@ defmodule SymphonyElixir.AttemptFuseTest do
             actor_id: 88
             app_id: 99
             activation_label: "pilot:symphony"
-            source_revision: "#{String.duplicate("a", 40)}"
+            source_revision: "#{source_revision}"
             high_water_root: "#{Path.join(root, "host-state")}"
         required_labels: ["agent-ready", "pilot:symphony"]
         active_states: ["open"]
@@ -240,6 +401,9 @@ defmodule SymphonyElixir.AttemptFuseTest do
         interval_ms: 10000
       workspace:
         root: "#{workspace_root}"
+      hooks:
+        after_create: #{after_create}
+        timeout_ms: 60000
       agent:
         max_concurrent_agents: 1
         max_turns: 24

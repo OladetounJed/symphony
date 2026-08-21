@@ -1134,23 +1134,36 @@ defmodule SymphonyElixir.Orchestrator do
          recipient,
          worker_host
        ) do
+    case post_reservation_dispatch_check(state) do
+      :ok ->
+        do_start_reserved_worker(
+          state,
+          issue,
+          retry_attempt,
+          attempt_evidence,
+          recipient,
+          worker_host
+        )
+
+      {:error, reason} ->
+        state
+        |> block_attempt_dispatch(
+          issue,
+          {reason, attempt_evidence},
+          attempt_evidence
+        )
+        |> suspend_dispatch()
+    end
+  end
+
+  defp post_reservation_dispatch_check(%State{} = state) do
     if dispatch_operational?(state) do
-      do_start_reserved_worker(
-        state,
-        issue,
-        retry_attempt,
-        attempt_evidence,
-        recipient,
-        worker_host
-      )
+      case AttemptFuse.validate_current(state.attempt_fuse) do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:attempt_fuse_invalid_after_reservation, reason}}
+      end
     else
-      state
-      |> block_attempt_dispatch(
-        issue,
-        {:dispatch_suspended_after_reservation, attempt_evidence},
-        attempt_evidence
-      )
-      |> suspend_dispatch()
+      {:error, :dispatch_suspended_after_reservation}
     end
   end
 

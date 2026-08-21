@@ -46,6 +46,15 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
         tracker_settings
       })
 
+      case Application.get_env(:symphony_elixir, :attempt_fuse_refresh_mutation) do
+        mutation when is_function(mutation, 0) ->
+          Application.delete_env(:symphony_elixir, :attempt_fuse_refresh_mutation)
+          mutation.()
+
+        _ ->
+          :ok
+      end
+
       {:ok, [Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_issue)]}
     end
   end
@@ -115,6 +124,32 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     def deactivate(issue, evidence, _attempt_fuse) do
       send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {
         :attempt_deactivated_after_trip,
+        issue.id,
+        evidence
+      })
+
+      {:ok, %{deactivated: true}}
+    end
+  end
+
+  defmodule DriftAfterReservationAttemptLedger do
+    def reserve(issue, max_attempts, _attempt_fuse) do
+      evidence = %{used: 1, max: max_attempts, exhausted: false}
+      mutation = Application.fetch_env!(:symphony_elixir, :attempt_fuse_reservation_mutation)
+      :ok = mutation.()
+
+      send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {
+        :attempt_reserved_then_drifted,
+        issue.id,
+        evidence
+      })
+
+      {:ok, evidence}
+    end
+
+    def deactivate(issue, evidence, _attempt_fuse) do
+      send(Application.fetch_env!(:symphony_elixir, :attempt_fuse_test_pid), {
+        :attempt_deactivated_after_drift,
         issue.id,
         evidence
       })
@@ -374,6 +409,7 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
             :github_client_module,
             :attempt_fuse_test_issue,
             :attempt_fuse_test_pid,
+            :attempt_fuse_refresh_mutation,
             :attempt_fuse_before_run_mutation
           ] do
         Application.delete_env(:symphony_elixir, key)
@@ -415,6 +451,68 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     assert_receive :app_server_stop
     assert_receive {:workspace_after_run, _, "frozen-worker", ^execution_settings}
     refute_receive {:app_server_turn, _}, 0
+  end
+
+  test "the production continuation read fails closed when configuration drifts during the fetch" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-agent-runner-refresh-drift-#{suffix}")
+    workflow_path = Workflow.workflow_file_path()
+    lock_port = available_port()
+    issue = issue(suffix)
+    binding = %{tool_specs: [], secret_environment_names: ["FROZEN_TRACKER_TOKEN"]}
+
+    stop_default_runtime!()
+    Application.put_env(:symphony_elixir, :workspace_module, ObservingWorkspace)
+    Application.put_env(:symphony_elixir, :codex_app_server_module, ObservingAppServer)
+    Application.put_env(:symphony_elixir, :github_client_module, FrozenSettingsGitHubClient)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
+
+    on_exit(fn ->
+      for key <- [
+            :workspace_module,
+            :codex_app_server_module,
+            :github_client_module,
+            :attempt_fuse_test_issue,
+            :attempt_fuse_test_pid,
+            :attempt_fuse_refresh_mutation
+          ] do
+        Application.delete_env(:symphony_elixir, key)
+      end
+
+      write_workflow_file!(workflow_path, tracker_kind: "memory")
+      restart_default_runtime!()
+      File.rm_rf(root)
+    end)
+
+    write_github_attempt_workflow!(workflow_path, root, lock_port, max_turns: 2)
+    assert :ok = WorkflowStore.force_reload()
+    frozen = Config.settings!() |> AttemptFuse.snapshot()
+
+    Application.put_env(:symphony_elixir, :attempt_fuse_refresh_mutation, fn ->
+      write_github_attempt_workflow!(workflow_path, root, lock_port,
+        max_turns: 3,
+        source_revision: String.duplicate("b", 40)
+      )
+
+      WorkflowStore.force_reload()
+    end)
+
+    assert_raise RuntimeError, ~r/attempt_fuse_config_drift/, fn ->
+      AgentRunner.run(issue, self(),
+        attempt_fuse: frozen,
+        dynamic_tool_binding: binding
+      )
+    end
+
+    assert_receive {:app_server_turn, first_prompt}
+    assert first_prompt =~ "Disposable attempt-fuse rehearsal"
+    assert_receive {:frozen_issue_refresh, [issue_id], tracker_settings}
+    assert issue_id == issue.id
+    assert tracker_settings == frozen.execution_settings.tracker
+    refute_receive {:app_server_turn, _}, 0
+    assert_receive :app_server_stop
+    assert_receive {:workspace_after_run, _, _, _}
   end
 
   test "the production AgentRunner rejects hook-time execution-profile drift before App Server launch" do
@@ -837,6 +935,78 @@ defmodule SymphonyElixir.OrchestratorAttemptFuseTest do
     refute_receive {:worker_started, _}, 200
     assert :sys.get_state(orchestrator_name).dispatch_suspended
     refute InstanceLock.operational?(lock_name)
+  end
+
+  test "configuration drift during reservation consumes evidence but starts no worker" do
+    suffix = System.unique_integer([:positive])
+    root = Path.join(canonical_tmp_dir(), "symphony-attempt-reservation-drift-#{suffix}")
+    workflow_path = Workflow.workflow_file_path()
+    runtime_name = Module.concat(__MODULE__, "ReservationDriftRuntime#{suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "ReservationDriftOrchestrator#{suffix}")
+    lock_name = Module.concat(__MODULE__, "ReservationDriftLock#{suffix}")
+    lock_port = available_port()
+    issue = issue(suffix)
+
+    stop_default_runtime!()
+    Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
+
+    Application.put_env(
+      :symphony_elixir,
+      :github_attempt_ledger_module,
+      DriftAfterReservationAttemptLedger
+    )
+
+    Application.put_env(:symphony_elixir, :agent_runner_module, ScriptedRunner)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_issue, issue)
+    Application.put_env(:symphony_elixir, :attempt_fuse_test_pid, self())
+
+    Application.put_env(:symphony_elixir, :attempt_fuse_reservation_mutation, fn ->
+      write_github_attempt_workflow!(workflow_path, root, lock_port, source_revision: String.duplicate("b", 40))
+
+      WorkflowStore.force_reload()
+    end)
+
+    on_exit(fn ->
+      if pid = Process.whereis(runtime_name), do: GenServer.stop(pid)
+
+      for key <- [
+            :github_client_module,
+            :github_attempt_ledger_module,
+            :agent_runner_module,
+            :attempt_fuse_test_issue,
+            :attempt_fuse_test_pid,
+            :attempt_fuse_reservation_mutation
+          ] do
+        Application.delete_env(:symphony_elixir, key)
+      end
+
+      write_workflow_file!(workflow_path, tracker_kind: "memory")
+      restart_default_runtime!()
+      File.rm_rf(root)
+    end)
+
+    write_github_attempt_workflow!(workflow_path, root, lock_port)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:ok, runtime_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_name,
+               orchestrator_name: orchestrator_name,
+               task_supervisor_name: Module.concat(__MODULE__, "ReservationDriftTasks#{suffix}"),
+               instance_lock_name: lock_name
+             )
+
+    Process.unlink(runtime_pid)
+    assert_receive {:attempt_reserved_then_drifted, issue_id, evidence}, 3_000
+    assert issue_id == issue.id
+    assert evidence.used == 1
+
+    assert_receive {:attempt_deactivated_after_drift, ^issue_id, deactivation_evidence}, 3_000
+    assert deactivation_evidence.used == 1
+    assert deactivation_evidence.reason =~ "attempt_fuse_invalid_after_reservation"
+
+    refute_receive {:worker_started, _}, 200
+    assert :sys.get_state(orchestrator_name).dispatch_suspended
   end
 
   test "real supervised runtime starts exactly five workers across restart and never reaches Codex" do

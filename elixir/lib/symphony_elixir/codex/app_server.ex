@@ -42,9 +42,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     attempt_fuse = Keyword.get(opts, :attempt_fuse)
     execution_settings = execution_settings(opts, attempt_fuse)
-    workspace_root = execution_workspace_root(attempt_fuse, execution_settings, worker_host)
 
     with :ok <- validate_attempt_fuse(attempt_fuse),
+         :ok <- notify_workspace_boundary(workspace, worker_host),
+         workspace_root <-
+           execution_workspace_root(attempt_fuse, execution_settings, worker_host),
          {:ok, dynamic_tool_binding} <- session_tool_binding(opts, attempt_fuse),
          {:ok, expanded_workspace} <-
            validate_workspace_cwd(workspace, worker_host, workspace_root),
@@ -120,6 +122,20 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp execution_workspace_root(_attempt_fuse, _settings, nil), do: Config.local_workspace_root()
   defp execution_workspace_root(_attempt_fuse, settings, _worker_host), do: settings.workspace.root
+
+  defp notify_workspace_boundary(workspace, worker_host) do
+    case Application.get_env(:symphony_elixir, :app_server_workspace_boundary_observer) do
+      observer when is_function(observer, 2) ->
+        case observer.(workspace, worker_host) do
+          :ok -> :ok
+          {:error, _reason} = error -> error
+          other -> {:error, {:app_server_workspace_boundary_observer_invalid, other}}
+        end
+
+      _ ->
+        :ok
+    end
+  end
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
@@ -215,14 +231,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
-  end
-
-  @doc false
-  @spec validate_workspace_cwd_for_test(Path.t(), Path.t()) ::
-          {:ok, Path.t()} | {:error, term()}
-  def validate_workspace_cwd_for_test(workspace, workspace_root)
-      when is_binary(workspace) and is_binary(workspace_root) do
-    validate_workspace_cwd(workspace, nil, workspace_root)
   end
 
   defp validate_workspace_cwd(workspace, nil, workspace_root)

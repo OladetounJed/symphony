@@ -21,29 +21,34 @@ defmodule SymphonyElixir.Workspace do
   def create_for_issue(issue_or_identifier, worker_host, attempt_fuse) do
     issue_context = issue_context(issue_or_identifier)
     settings = execution_settings(attempt_fuse)
-    workspace_root = execution_workspace_root(attempt_fuse, settings, worker_host)
 
     try do
       safe_id = workspace_key(issue_or_identifier)
 
       with :ok <- validate_attempt_fuse(attempt_fuse),
+           :ok <- notify_workspace_boundary(:before_path, safe_id, worker_host),
+           workspace_root <- execution_workspace_root(attempt_fuse, settings, worker_host),
            {:ok, workspace} <-
              workspace_path_for_issue(safe_id, worker_host, workspace_root),
            :ok <- validate_workspace_path(workspace, worker_host, workspace_root),
            :ok <- validate_attempt_fuse(attempt_fuse),
            {:ok, workspace, created?} <-
-             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms),
-           :ok <- validate_attempt_fuse(attempt_fuse) do
-        case maybe_run_after_create_hook(
-               workspace,
-               issue_context,
-               created?,
-               worker_host,
-               settings.hooks
-             ) do
-          :ok ->
+             ensure_workspace(workspace, worker_host, settings.hooks.timeout_ms) do
+        result =
+          with :ok <- notify_workspace_boundary(:prepared, workspace, worker_host),
+               :ok <- validate_attempt_fuse(attempt_fuse),
+               :ok <-
+                 maybe_run_after_create_hook(
+                   workspace,
+                   issue_context,
+                   created?,
+                   worker_host,
+                   settings.hooks
+                 ) do
             {:ok, workspace}
+          end
 
+        case result do
           {:error, _reason} = error ->
             cleanup_failed_new_workspace(
               workspace,
@@ -53,6 +58,9 @@ defmodule SymphonyElixir.Workspace do
             )
 
             error
+
+          {:ok, _workspace} = success ->
+            success
         end
       end
     rescue
@@ -115,15 +123,22 @@ defmodule SymphonyElixir.Workspace do
     {:ok, workspace, true}
   end
 
+  defp notify_workspace_boundary(stage, value, worker_host) do
+    case Application.get_env(:symphony_elixir, :workspace_boundary_observer) do
+      observer when is_function(observer, 3) ->
+        case observer.(stage, value, worker_host) do
+          :ok -> :ok
+          {:error, _reason} = error -> error
+          other -> {:error, {:workspace_boundary_observer_invalid, other}}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
-
-  @doc false
-  @spec validate_workspace_path_for_test(Path.t(), Path.t()) :: :ok | {:error, term()}
-  def validate_workspace_path_for_test(workspace, workspace_root)
-      when is_binary(workspace) and is_binary(workspace_root) do
-    validate_local_workspace_path(workspace, workspace_root)
-  end
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
